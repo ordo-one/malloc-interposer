@@ -31,6 +31,21 @@ let package = Package(
             name: "MallocInterposerC",
             path: "Sources/MallocInterposerC",
             publicHeadersPath: "include",
+            cSettings: [
+                // Force aggressive inlining of the malloc hot path. At the
+                // default optimisation level clang outlines the counting
+                // branch into a cold helper, eating ~5 ns per malloc in
+                // extra call overhead. The `flatten` attribute on the
+                // replacement_* entry points keeps the inlined body intact.
+                .unsafeFlags([
+                    "-O3",
+                    "-fno-stack-protector",
+                    // Pass-through to LLVM: disable the late machine
+                    // outliner, which otherwise re-extracts shared code
+                    // blocks back into calls.
+                    "-mllvm", "-enable-machine-outliner=never",
+                ], .when(configuration: .release)),
+            ],
             linkerSettings: [
                 .linkedLibrary("dl", .when(platforms: [.linux])),
             ]
