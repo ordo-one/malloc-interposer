@@ -23,20 +23,24 @@ routed through the interposer:
   defines the symbols directly and resolves the real libc entries
   through `dlsym(RTLD_NEXT, …)`.
 
-When counting is enabled the interposer increments six 64-bit atomic
-counters per call:
+When counting is enabled the interposer updates a small bundle of
+per-thread counters on every intercepted call. `getStatistics()` returns
+six fields:
 
-| counter | meaning |
+| field | meaning |
 | --- | --- |
-| `malloc_count` | total allocation calls |
-| `malloc_bytes` | total requested bytes allocated |
-| `malloc_small` | allocations with requested size ≤ page size |
-| `malloc_large` | allocations with requested size  > page size |
-| `free_count`   | total `free` calls |
-| `free_bytes`   | total bytes freed |
+| `mallocCount`      | total allocation calls (= small + large) |
+| `mallocBytesCount` | total requested bytes allocated |
+| `mallocSmallCount` | allocations with requested size ≤ page size |
+| `mallocLargeCount` | allocations with requested size  > page size |
+| `freeCount`        | total `free` calls |
+| `freeBytesCount`   | total bytes freed |
 
 Counting is toggled at runtime — bracket the region you want to measure
 with `hook()` / `unhook()` and read the totals with `getStatistics()`.
+Snapshots are best-effort: under concurrent allocation traffic the six
+fields are not guaranteed to be mutually consistent. Bracketing with
+`hook()` / `unhook()` around a paused workload gives you a clean read.
 
 ## Header-prefix size tracking
 
@@ -53,13 +57,14 @@ are detected by a failing magic check and fall back to libc bookkeeping.
 ## Why a single combined dylib
 
 The interposer and the Swift wrapper ship in a single dynamic
-library — `libMallocInterposerSwift.dylib` / `.so`. The C interposer
-keeps its counters in `_Atomic int64_t` globals; for the Swift API's
-read to see the writes performed by the interposed `malloc`/`free`, the
-two must refer to the same memory, i.e. live in the same image. Splitting
-the C interposer into its own SwiftPM product would cause the C target
-to be statically embedded into the Swift dylib, producing two disconnected
-copies of the counters. Keeping everything in one library avoids that.
+library — `libMallocInterposerSwift.dylib` / `.so`. The C interposer's
+shared state — the linked list of per-thread counter blocks, the mutex
+that guards it, the dead-thread aggregate, and the `pthread_key_t`
+destructor — must all live in one image so the Swift API's read sees
+the writes performed by the interposed `malloc`/`free`. Splitting the
+C target into its own SwiftPM product would cause it to be statically
+embedded into the Swift dylib, producing two disconnected copies of all
+that state. Keeping everything in one library avoids that.
 
 ## Using it from Swift
 
@@ -155,10 +160,25 @@ it for the public symbols.
 
 ## Performance
 
-All counters are `_Atomic int64_t` updated with `memory_order_relaxed`,
-so the hot path per counted call is one branch on the enabled flag plus
-a handful of atomic adds. The Swift wrapper is purely a façade — no
-dispatch happens between user code and the C symbols.
+The hot path per counted call is one relaxed load of the enabled flag,
+one thread-local pointer load, and a handful of plain (non-atomic)
+stores into the calling thread's counter block. Each thread allocates
+its own block on first use and registers it with a `pthread_key_t`
+destructor, so thread exit folds the counts into a global aggregate
+rather than losing them. `getStatistics()` walks the live thread blocks
+under a mutex and sums in the dead-thread aggregate, so the read side
+is more expensive than the write side — call it outside the measured
+region.
+
+Avoiding global atomics on the hot path is most visible on glibc Linux,
+where `__thread` access compiles to a single TPIDR-relative load. On
+macOS `_Thread_local` still goes through `_tlv_get_addr` and the win
+over relaxed LSE atomics is smaller (a few ns/call), but the design
+still scales cleanly under multi-threaded contention because each
+writer thread touches only its own cache line.
+
+The Swift wrapper is purely a façade — no dispatch happens between
+user code and the C symbols.
 
 ## Requirements
 
