@@ -64,13 +64,13 @@ public class MallocInterposerSwift: @unchecked Sendable {
         malloc_interposer_reset()
     }
 
-    /// Resets counters to zero and enables counting.
+    /// Enables counting.
     ///
     /// After this call returns, every `malloc`, `calloc`, `realloc`, `free`
     /// (and friends) routed through the interposer is reflected in the
-    /// counters. Pair with ``unhook()`` to bracket a measured region.
+    /// counters. Call ``initialize()`` (or ``reset()``) first to start from a
+    /// known state. Pair with ``unhook()`` to bracket a measured region.
     public static func hook() {
-        malloc_interposer_reset()
         malloc_interposer_enable()
     }
 
