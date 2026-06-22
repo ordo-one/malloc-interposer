@@ -161,6 +161,75 @@ final class AlignedPointerSafetyTests: XCTestCase {
         }
     #endif
 
+    // MARK: Item B — the magic word alone must not claim a foreign pointer
+
+    /// A foreign block that merely happens to have our magic word in the bytes
+    /// before it must not be mis-claimed (that would free the wrong address).
+    /// The address-keyed tag closes the ~2⁻³² magic-only collision.
+    func testForeignPointerWithMagicButWrongTagIsNotOurs() {
+        withUnsafeTemporaryAllocation(byteCount: 64, alignment: 16) { buffer in
+            let base = buffer.baseAddress!
+            // Lay out a would-be 16-byte header before a fake user pointer:
+            // tag at offset 8 (left 0, won't match addr_tag), magic at offset 12.
+            (base + 8).storeBytes(of: UInt32(0), as: UInt32.self)
+            (base + 12).storeBytes(of: UInt32(0xC0FF_EE5A), as: UInt32.self)
+            let fakeUser = UnsafeRawPointer(base + 16)
+            XCTAssertFalse(
+                malloc_interposer_is_ours(fakeUser),
+                "a foreign pointer with only the magic (no matching address tag) must not be claimed"
+            )
+        }
+    }
+
+    // MARK: Item 7 — small/large split uses a fixed, architecture-independent boundary
+
+    /// The small/large boundary is a fixed 16 KiB constant, not the page size, so
+    /// an 8 KiB allocation is "small" on every architecture. With the page-size
+    /// split it would be "large" on a 4 KiB-page system (e.g. x86_64 Linux).
+    func testSmallLargeSplitUsesFixedBoundary() {
+        let iterations = 4_096
+        malloc_interposer_reset()
+        malloc_interposer_enable()
+        let before = currentSizeClasses()
+        for _ in 0 ..< iterations {
+            if let pointer = replacement_malloc(8 * 1_024) { // > 4 KiB page, < 16 KiB threshold
+                replacement_free(pointer)
+            }
+        }
+        let after = currentSizeClasses()
+        malloc_interposer_disable()
+        XCTAssertGreaterThanOrEqual(
+            after.small - before.small, Int64(iterations),
+            "8 KiB allocations must be classified small on every architecture"
+        )
+    }
+
+    // MARK: Item C — calloc returns zeroed, counted memory
+
+    /// Switching Linux calloc from malloc+memset to libc calloc must preserve
+    /// behavior: zeroed memory, counted as one allocation. (Regression guard;
+    /// the change itself is a page-fault/perf improvement with no visible delta.)
+    func testCallocReturnsZeroedCountedMemory() {
+        let count = 256, size = 8
+        malloc_interposer_reset()
+        malloc_interposer_enable()
+        let before = currentCounts()
+        guard let pointer = replacement_calloc(count, size) else {
+            malloc_interposer_disable()
+            return XCTFail("calloc failed")
+        }
+        let after = currentCounts()
+        var allZero = true
+        for offset in 0 ..< (count * size) where pointer.load(fromByteOffset: offset, as: UInt8.self) != 0 {
+            allZero = false
+            break
+        }
+        replacement_free(pointer)
+        malloc_interposer_disable()
+        XCTAssertTrue(allZero, "calloc memory must be zeroed")
+        XCTAssertEqual(after.malloc - before.malloc, 1, "calloc must count as one allocation")
+    }
+
     /// Runs `allocate` in a loop with counting enabled and asserts both the
     /// malloc and free counters advanced by at least the iteration count.
     /// Counting is process-global, so background allocations only ever *add* to
@@ -200,5 +269,15 @@ final class AlignedPointerSafetyTests: XCTestCase {
             &mallocCount, &mallocBytes, &mallocSmall, &mallocLarge, &freeCount, &freeBytes
         )
         return (mallocCount, freeCount)
+    }
+
+    private func currentSizeClasses() -> (small: Int64, large: Int64) {
+        var mallocCount: Int64 = 0, mallocBytes: Int64 = 0
+        var mallocSmall: Int64 = 0, mallocLarge: Int64 = 0
+        var freeCount: Int64 = 0, freeBytes: Int64 = 0
+        malloc_interposer_get_stats(
+            &mallocCount, &mallocBytes, &mallocSmall, &mallocLarge, &freeCount, &freeBytes
+        )
+        return (mallocSmall, mallocLarge)
     }
 }

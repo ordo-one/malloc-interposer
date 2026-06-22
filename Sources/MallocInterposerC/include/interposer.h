@@ -37,9 +37,15 @@
 
 #define MALLOC_INTERPOSER_MAGIC 0xC0FFEE5AU
 
+// Fixed small/large boundary (16 KiB). Using a constant instead of the runtime
+// page size keeps the small/large split architecture-independent (x86 4 KiB vs
+// arm64 16 KiB pages would otherwise classify the same allocation differently)
+// and approximates jemalloc's small/large size-class boundary.
+#define MALLOC_INTERPOSER_LARGE_THRESHOLD ((size_t)16384)
+
 typedef struct {
     size_t   requested_size; // offset 0
-    uint32_t reserved;       // offset 8
+    uint32_t addr_tag;       // offset 8  — address-keyed tag, paired with magic
     uint32_t magic;          // offset 12 — last 4 bytes for fast probe via *(user_ptr - 4)
 } malloc_header_t;
 
@@ -54,27 +60,39 @@ static inline void *malloc_interposer_user_for(void *raw) {
     return (char *)raw + sizeof(malloc_header_t);
 }
 
+// A cheap address-keyed tag stored alongside the magic. The magic alone matches
+// unrelated memory ~1 in 2^32; requiring the preceding word to also equal a hash
+// of *this* pointer's address makes a false positive astronomically unlikely —
+// which matters because a false positive frees the wrong address.
+static inline uint32_t malloc_interposer_addr_tag(const void *user_ptr) {
+    uintptr_t addr = (uintptr_t)user_ptr;
+    addr *= 0x9E3779B97F4A7C15ULL; // golden-ratio mix
+    return (uint32_t)(addr >> 32) ^ MALLOC_INTERPOSER_MAGIC;
+}
+
 static inline bool malloc_interposer_is_ours(const void *user_ptr) {
     if (!user_ptr) return false;
 #if __APPLE__
-    // The magic probe below reads the 4 bytes *before* user_ptr. For our own
-    // pointers those bytes are our header, always mapped. For a page-aligned
-    // pointer, though, they fall in the *previous* page — and libc valloc /
-    // large posix_memalign hand back page-aligned pointers backed by a fresh
-    // mmap whose preceding page is unmapped, so the probe would fault.
+    // The probe below reads the 8 bytes *before* user_ptr. For our own pointers
+    // those bytes are our header, always mapped. For a page-aligned pointer,
+    // though, they fall in the *previous* page — and libc valloc / large
+    // posix_memalign hand back page-aligned pointers backed by a fresh mmap
+    // whose preceding page is unmapped, so the probe would fault.
     //
     // Such allocations are libc allocation *starts*, which malloc_zone_from_ptr
     // resolves to a zone; our pointers are interior (raw + header) and resolve
-    // to NULL, so they still fall through to the magic probe (their preceding
-    // page holds our header and is mapped). Gate on 4096 — the smallest page
-    // size — to keep the zone lookup off the hot path for the common case.
+    // to NULL, so they still fall through to the probe (their preceding page
+    // holds our header and is mapped). Gate on 4096 — the smallest page size —
+    // to keep the zone lookup off the hot path for the common case.
     if (((uintptr_t)user_ptr & 0xFFFU) == 0 && malloc_zone_from_ptr(user_ptr) != NULL) {
         return false;
     }
 #endif
-    uint32_t magic;
-    memcpy(&magic, (const char *)user_ptr - sizeof(uint32_t), sizeof(magic));
-    return magic == MALLOC_INTERPOSER_MAGIC;
+    // Read the tag (offset 8) and magic (offset 12) in one go.
+    uint32_t fields[2]; // fields[0] = addr_tag, fields[1] = magic
+    memcpy(fields, (const char *)user_ptr - 2 * sizeof(uint32_t), sizeof(fields));
+    return fields[1] == MALLOC_INTERPOSER_MAGIC
+        && fields[0] == malloc_interposer_addr_tag(user_ptr);
 }
 
 // ---------------------------------------------------------------------------

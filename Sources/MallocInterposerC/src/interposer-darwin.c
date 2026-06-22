@@ -84,6 +84,10 @@ static counter_block_t *g_blocks_head = NULL;
 static counter_block_t g_dead_aggregate = {0};
 
 static _Thread_local counter_block_t *t_block = NULL;
+// Set while this thread is creating its counter block; if block creation itself
+// allocates, the nested count would otherwise recurse into tls_block_init and
+// deadlock on g_list_mutex.
+static _Thread_local bool t_initializing = false;
 static pthread_key_t g_block_key;
 static pthread_once_t g_key_once = PTHREAD_ONCE_INIT;
 
@@ -132,24 +136,30 @@ static void init_block_key(void) {
 }
 
 static __attribute__((noinline)) counter_block_t *tls_block_init(void) {
+    t_initializing = true;
     pthread_once(&g_key_once, init_block_key);
 
     counter_block_t *b = (counter_block_t *)calloc(1, sizeof(counter_block_t));
-    if (!b) return NULL;
-    pthread_setspecific(g_block_key, b);
+    if (b) {
+        pthread_setspecific(g_block_key, b);
 
-    pthread_mutex_lock(&g_list_mutex);
-    b->next = g_blocks_head;
-    g_blocks_head = b;
-    pthread_mutex_unlock(&g_list_mutex);
+        pthread_mutex_lock(&g_list_mutex);
+        b->next = g_blocks_head;
+        g_blocks_head = b;
+        pthread_mutex_unlock(&g_list_mutex);
 
-    t_block = b;
+        t_block = b;
+    }
+    t_initializing = false;
     return b;
 }
 
 static __attribute__((always_inline)) counter_block_t *get_tls_block(void) {
     counter_block_t *b = t_block;
     if (__builtin_expect(b == NULL, 0)) {
+        // A reentrant allocation while we're building the block must not recurse
+        // back in (that would deadlock on g_list_mutex); skip counting it.
+        if (t_initializing) return NULL;
         b = tls_block_init();
     }
     return b;
@@ -220,6 +230,13 @@ void malloc_interposer_get_stats(int64_t *malloc_count, int64_t *malloc_bytes,
 
 // Inline counting helpers ---------------------------------------------------
 //
+// Byte basis: `size` is whatever each path supplies — requested bytes on the
+// header-prefixed paths (malloc/calloc/realloc), and libc's usable size on the
+// aligned/legacy paths (valloc/posix_memalign/aligned_alloc) which can't carry
+// a header. A given allocation's alloc and free use the same basis, so the
+// delta metrics stay correct; only the gross byte total can read slightly high
+// for aligned allocations.
+//
 // All counter updates land in the calling thread's TLS block. The block is
 // created lazily on first use. Once the pointer is cached in the _Thread_local
 // slot, every subsequent call is a non-atomic increment on private memory.
@@ -228,8 +245,10 @@ static __attribute__((always_inline)) void count_malloc(size_t size) {
     counter_block_t *b = get_tls_block();
     if (__builtin_expect(b == NULL, 0)) return;
     b->malloc_bytes += (int64_t)size;
-    // Branchless small/large split — index 0 is small, 1 is large.
-    b->malloc_size_class[size > g_page_size]++;
+    // Branchless small/large split — index 0 is small, 1 is large. The boundary
+    // is a fixed constant (not the page size) so the split is architecture-
+    // independent; see MALLOC_INTERPOSER_LARGE_THRESHOLD.
+    b->malloc_size_class[size > MALLOC_INTERPOSER_LARGE_THRESHOLD]++;
 }
 
 static __attribute__((always_inline)) void count_free(size_t size) {
@@ -243,10 +262,11 @@ static __attribute__((always_inline)) void count_free(size_t size) {
 
 static __attribute__((always_inline)) void *write_header(void *raw, size_t size) {
     malloc_header_t *hdr = (malloc_header_t *)raw;
+    void *user = malloc_interposer_user_for(raw);
     hdr->requested_size = size;
-    hdr->reserved = 0;
+    hdr->addr_tag = malloc_interposer_addr_tag(user);
     hdr->magic = MALLOC_INTERPOSER_MAGIC;
-    return malloc_interposer_user_for(raw);
+    return user;
 }
 
 // Replacement functions -----------------------------------------------------
