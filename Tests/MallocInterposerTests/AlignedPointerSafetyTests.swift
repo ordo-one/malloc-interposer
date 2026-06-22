@@ -8,7 +8,8 @@
 // http://www.apache.org/licenses/LICENSE-2.0
 //
 
-import XCTest
+import Foundation
+import Testing
 
 #if canImport(Darwin)
     import Darwin
@@ -20,67 +21,67 @@ import XCTest
 
 import MallocInterposerC
 
+#if canImport(Darwin)
+    // `Bundle(for:)` needs a class to locate the test bundle's directory.
+    private final class BundleMarker {}
+#endif
+
 /// Regression coverage for how the interposer treats pointers it did not hand
 /// out (aligned/legacy allocations that carry no size header).
-final class AlignedPointerSafetyTests: XCTestCase {
+///
+/// Serialized because several tests share the interposer's process-global
+/// counters. Skipped under AddressSanitizer/ThreadSanitizer, where the
+/// classifier's read-before-pointer probe is incompatible with their bounds
+/// checking so the hooks are compiled out.
+@Suite(.serialized, .enabled(if: malloc_interposer_global_hooks_installed() != 0))
+struct AlignedPointerSafetyTests {
     private var pageSize: Int {
         Int(sysconf(Int32(_SC_PAGESIZE)))
     }
 
-    override func setUpWithError() throws {
-        // These tests drive the classifier's "read the word before the pointer"
-        // probe directly, which AddressSanitizer/ThreadSanitizer reject; the
-        // hooks are compiled out there, so there is nothing meaningful to test.
-        try XCTSkipUnless(
-            malloc_interposer_global_hooks_installed() != 0,
-            "interposer hooks are disabled under sanitizers"
-        )
-    }
-
     // MARK: Issue 1 — classifying page-aligned external pointers must not fault
 
-    // `malloc_interposer_is_ours` probes the four bytes immediately *before* the
+    // `malloc_interposer_is_ours` probes the bytes immediately *before* the
     // pointer for its magic word. libc `valloc` / large `posix_memalign` return
     // page-aligned pointers whose preceding page is an unmapped guard page
     // (Darwin), so that probe reads unmapped memory and crashes. The classifier
     // must recognise such external pointers without dereferencing the guard
-    // page. The check runs in a clean child process where libc reliably places
-    // a large allocation against a guard page; this does not reproduce in the
+    // page. The check runs in a clean child process where libc reliably places a
+    // large allocation against a guard page; this does not reproduce in the
     // populated test process. (Darwin-only: glibc keeps readable chunk metadata
     // before every allocation, so the probe never faults there.)
     #if canImport(Darwin)
-        func testIsOursDoesNotFaultOnPageAlignedExternalPointer() throws {
+        @Test
+        func isOursDoesNotFaultOnPageAlignedExternalPointer() throws {
             try assertCrashProbeSucceeds(mode: "is_ours")
         }
 
-        func testFreeDoesNotFaultOnPageAlignedExternalPointer() throws {
+        @Test
+        func freeDoesNotFaultOnPageAlignedExternalPointer() throws {
             try assertCrashProbeSucceeds(mode: "free")
         }
 
-        private func assertCrashProbeSucceeds(mode: String, file: StaticString = #filePath, line: UInt = #line) throws {
+        private func assertCrashProbeSucceeds(mode: String) throws {
             let process = Process()
             process.executableURL = try crashProbeURL()
             process.arguments = [mode]
             try process.run()
             process.waitUntilExit()
-            XCTAssertEqual(
-                process.terminationReason, .exit,
-                "crash probe (\(mode)) was killed by a signal — the classifier dereferenced a guard page",
-                file: file, line: line
+            #expect(
+                process.terminationReason == .exit,
+                "crash probe (\(mode)) was killed by a signal — the classifier dereferenced a guard page"
             )
-            XCTAssertEqual(
-                process.terminationStatus, 0,
-                "crash probe (\(mode)) reported a classification error (status \(process.terminationStatus))",
-                file: file, line: line
+            #expect(
+                process.terminationStatus == 0,
+                "crash probe (\(mode)) reported a classification error (status \(process.terminationStatus))"
             )
         }
 
-        /// The crash-probe executable is built into the same directory as the test
-        /// bundle.
+        /// The crash-probe executable is built into the same directory as the test bundle.
         private func crashProbeURL() throws -> URL {
-            let buildDirectory = Bundle(for: Self.self).bundleURL.deletingLastPathComponent()
+            let buildDirectory = Bundle(for: BundleMarker.self).bundleURL.deletingLastPathComponent()
             let url = buildDirectory.appendingPathComponent("InterposerCrashProbe")
-            try XCTSkipUnless(
+            try #require(
                 FileManager.default.isExecutableFile(atPath: url.path),
                 "InterposerCrashProbe not found at \(url.path)"
             )
@@ -93,14 +94,15 @@ final class AlignedPointerSafetyTests: XCTestCase {
     /// `posix_memalign` must return memory aligned to the requested boundary;
     /// the interposer previously discarded the alignment and returned only
     /// 16-byte-aligned memory.
-    func testReplacementPosixMemalignHonorsAlignment() {
+    @Test
+    func posixMemalignHonorsAlignment() {
         for alignment in [16, 32, 64, 128, 256, 512, 1_024] {
             var pointer: UnsafeMutableRawPointer?
             let result = replacement_posix_memalign(&pointer, alignment, 1_024)
-            XCTAssertEqual(result, 0, "posix_memalign(alignment: \(alignment)) returned \(result)")
+            #expect(result == 0, "posix_memalign(alignment: \(alignment)) returned \(result)")
             let address = UInt(bitPattern: pointer)
-            XCTAssertEqual(
-                address % UInt(alignment), 0,
+            #expect(
+                address.isMultiple(of: UInt(alignment)),
                 "posix_memalign(alignment: \(alignment)) returned 0x\(String(address, radix: 16)), not aligned"
             )
             replacement_free(pointer)
@@ -108,11 +110,12 @@ final class AlignedPointerSafetyTests: XCTestCase {
     }
 
     /// `valloc` must return page-aligned memory.
-    func testReplacementVallocIsPageAligned() {
+    @Test
+    func vallocIsPageAligned() {
         let pointer = replacement_valloc(1_024)
-        XCTAssertNotNil(pointer)
-        XCTAssertEqual(
-            UInt(bitPattern: pointer) % UInt(pageSize), 0,
+        #expect(pointer != nil)
+        #expect(
+            UInt(bitPattern: pointer).isMultiple(of: UInt(pageSize)),
             "valloc returned memory that is not page-aligned"
         )
         replacement_free(pointer)
@@ -124,21 +127,17 @@ final class AlignedPointerSafetyTests: XCTestCase {
     /// size, so callers that grow in place (Swift Array/ManagedBuffer) never saw
     /// the spare capacity libc actually handed out. A size query must report the
     /// usable capacity, which for a deliberately rounded-up request exceeds it.
-    func testSizeQueryReportsUsableCapacityNotRequested() {
+    @Test
+    func sizeQueryReportsUsableCapacityNotRequested() throws {
         let requested = 1 // a 1-byte request always rounds up to a larger block
-        guard let pointer = replacement_malloc(requested) else {
-            return XCTFail("malloc failed")
-        }
+        let pointer = try #require(replacement_malloc(requested), "malloc failed")
         defer { replacement_free(pointer) }
         #if canImport(Darwin)
             let reported = replacement_malloc_size(pointer)
         #else
             let reported = replacement_malloc_usable_size(pointer)
         #endif
-        XCTAssertGreaterThan(
-            reported, requested,
-            "size query must report usable capacity, not the requested size"
-        )
+        #expect(reported > requested, "size query must report usable capacity, not the requested size")
     }
 
     // MARK: Issue 8 — aligned allocators must be counted
@@ -146,18 +145,16 @@ final class AlignedPointerSafetyTests: XCTestCase {
     /// `aligned_alloc` was not intercepted, so its allocations were invisible to
     /// the counters while their frees still counted — an unbalanced malloc/free
     /// delta. Each alloc/free pair must move both counters.
-    func testAlignedAllocIsCounted() {
-        assertAllocationsAreCounted {
-            replacement_aligned_alloc(64, 1_024)
-        }
+    @Test
+    func alignedAllocIsCounted() {
+        assertAllocationsAreCounted { replacement_aligned_alloc(64, 1_024) }
     }
 
     #if !canImport(Darwin)
         /// `memalign` (glibc) had the same gap as `aligned_alloc`.
-        func testMemalignIsCounted() {
-            assertAllocationsAreCounted {
-                replacement_memalign(64, 1_024)
-            }
+        @Test
+        func memalignIsCounted() {
+            assertAllocationsAreCounted { replacement_memalign(64, 1_024) }
         }
     #endif
 
@@ -166,7 +163,8 @@ final class AlignedPointerSafetyTests: XCTestCase {
     /// A foreign block that merely happens to have our magic word in the bytes
     /// before it must not be mis-claimed (that would free the wrong address).
     /// The address-keyed tag closes the ~2⁻³² magic-only collision.
-    func testForeignPointerWithMagicButWrongTagIsNotOurs() {
+    @Test
+    func foreignPointerWithMagicButWrongTagIsNotOurs() {
         withUnsafeTemporaryAllocation(byteCount: 64, alignment: 16) { buffer in
             let base = buffer.baseAddress!
             // Lay out a would-be 16-byte header before a fake user pointer:
@@ -174,8 +172,8 @@ final class AlignedPointerSafetyTests: XCTestCase {
             (base + 8).storeBytes(of: UInt32(0), as: UInt32.self)
             (base + 12).storeBytes(of: UInt32(0xC0FF_EE5A), as: UInt32.self)
             let fakeUser = UnsafeRawPointer(base + 16)
-            XCTAssertFalse(
-                malloc_interposer_is_ours(fakeUser),
+            #expect(
+                !malloc_interposer_is_ours(fakeUser),
                 "a foreign pointer with only the magic (no matching address tag) must not be claimed"
             )
         }
@@ -186,7 +184,8 @@ final class AlignedPointerSafetyTests: XCTestCase {
     /// The small/large boundary is a fixed 16 KiB constant, not the page size, so
     /// an 8 KiB allocation is "small" on every architecture. With the page-size
     /// split it would be "large" on a 4 KiB-page system (e.g. x86_64 Linux).
-    func testSmallLargeSplitUsesFixedBoundary() {
+    @Test
+    func smallLargeSplitUsesFixedBoundary() {
         let iterations = 4_096
         malloc_interposer_reset()
         malloc_interposer_enable()
@@ -198,8 +197,8 @@ final class AlignedPointerSafetyTests: XCTestCase {
         }
         let after = currentSizeClasses()
         malloc_interposer_disable()
-        XCTAssertGreaterThanOrEqual(
-            after.small - before.small, Int64(iterations),
+        #expect(
+            after.small - before.small >= Int64(iterations),
             "8 KiB allocations must be classified small on every architecture"
         )
     }
@@ -207,17 +206,15 @@ final class AlignedPointerSafetyTests: XCTestCase {
     // MARK: Item C — calloc returns zeroed, counted memory
 
     /// Switching Linux calloc from malloc+memset to libc calloc must preserve
-    /// behavior: zeroed memory, counted as one allocation. (Regression guard;
-    /// the change itself is a page-fault/perf improvement with no visible delta.)
-    func testCallocReturnsZeroedCountedMemory() {
+    /// behavior: zeroed memory, counted as one allocation. (Regression guard; the
+    /// change itself is a page-fault/perf improvement with no visible delta.)
+    @Test
+    func callocReturnsZeroedCountedMemory() throws {
         let count = 256, size = 8
         malloc_interposer_reset()
         malloc_interposer_enable()
         let before = currentCounts()
-        guard let pointer = replacement_calloc(count, size) else {
-            malloc_interposer_disable()
-            return XCTFail("calloc failed")
-        }
+        let pointer = try #require(replacement_calloc(count, size), "calloc failed")
         let after = currentCounts()
         var allZero = true
         for offset in 0 ..< (count * size) where pointer.load(fromByteOffset: offset, as: UInt8.self) != 0 {
@@ -226,19 +223,15 @@ final class AlignedPointerSafetyTests: XCTestCase {
         }
         replacement_free(pointer)
         malloc_interposer_disable()
-        XCTAssertTrue(allZero, "calloc memory must be zeroed")
-        XCTAssertEqual(after.malloc - before.malloc, 1, "calloc must count as one allocation")
+        #expect(allZero, "calloc memory must be zeroed")
+        #expect(after.malloc - before.malloc == 1, "calloc must count as one allocation")
     }
 
     /// Runs `allocate` in a loop with counting enabled and asserts both the
     /// malloc and free counters advanced by at least the iteration count.
     /// Counting is process-global, so background allocations only ever *add* to
     /// the deltas — a large loop keeps the signal well clear of that noise.
-    private func assertAllocationsAreCounted(
-        _ allocate: () -> UnsafeMutableRawPointer?,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) {
+    private func assertAllocationsAreCounted(_ allocate: () -> UnsafeMutableRawPointer?) {
         let iterations = 4_096
         malloc_interposer_reset()
         malloc_interposer_enable()
@@ -251,14 +244,8 @@ final class AlignedPointerSafetyTests: XCTestCase {
         let after = currentCounts()
         malloc_interposer_disable()
 
-        XCTAssertGreaterThanOrEqual(
-            after.malloc - before.malloc, Int64(iterations),
-            "allocations were not counted", file: file, line: line
-        )
-        XCTAssertGreaterThanOrEqual(
-            after.free - before.free, Int64(iterations),
-            "frees were not counted", file: file, line: line
-        )
+        #expect(after.malloc - before.malloc >= Int64(iterations), "allocations were not counted")
+        #expect(after.free - before.free >= Int64(iterations), "frees were not counted")
     }
 
     private func currentCounts() -> (malloc: Int64, free: Int64) {

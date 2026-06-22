@@ -13,6 +13,12 @@ import PackageDescription
 // class of footgun.
 let package = Package(
     name: "malloc-interposer",
+    // aligned_alloc (C11) requires macOS 10.15 / iOS 13; set the floor so the
+    // interposer's aligned_alloc interception doesn't warn on the default target.
+    platforms: [
+        .macOS(.v10_15),
+        .iOS(.v13),
+    ],
     products: [
         // The dylib to preload (DYLD_INSERT_LIBRARIES / LD_PRELOAD) and to
         // link against from Swift code. Combines the C interposer with the

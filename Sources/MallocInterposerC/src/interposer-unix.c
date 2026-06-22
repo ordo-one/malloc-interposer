@@ -51,7 +51,7 @@ int malloc_interposer_global_hooks_installed(void) {
 /* a big block of memory that we'll use for recursive mallocs */
 static char g_recursive_malloc_mem[10 * 1024 * 1024] = {0};
 /* the index of the first free byte */
-static _Atomic ptrdiff_t g_recursive_malloc_next_free_ptr = ATOMIC_VAR_INIT(0);
+static _Atomic ptrdiff_t g_recursive_malloc_next_free_ptr = 0;
 
 #define LIBC_SYMBOL(_fun) "" # _fun
 
