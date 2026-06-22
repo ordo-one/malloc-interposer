@@ -13,6 +13,12 @@ import PackageDescription
 // class of footgun.
 let package = Package(
     name: "malloc-interposer",
+    // aligned_alloc (C11) requires macOS 10.15 / iOS 13; set the floor so the
+    // interposer's aligned_alloc interception doesn't warn on the default target.
+    platforms: [
+        .macOS(.v10_15),
+        .iOS(.v13),
+    ],
     products: [
         // The dylib to preload (DYLD_INSERT_LIBRARIES / LD_PRELOAD) and to
         // link against from Swift code. Combines the C interposer with the
@@ -39,6 +45,21 @@ let package = Package(
             name: "MallocInterposerSwift",
             dependencies: ["MallocInterposerC"],
             path: "Sources/MallocInterposerSwift"
+        ),
+        // Standalone helper the death tests spawn in a clean process — the
+        // guard-page fault only reproduces in a sparsely-mapped address space.
+        .executableTarget(
+            name: "InterposerCrashProbe",
+            dependencies: ["MallocInterposerC"],
+            path: "Tests/InterposerCrashProbe"
+        ),
+        // Unit tests exercise the C interposer's replacement_* functions and
+        // pointer classifier directly, so they depend on the C target. The
+        // dependency on the crash probe ensures it is built before tests run.
+        .testTarget(
+            name: "MallocInterposerTests",
+            dependencies: ["MallocInterposerC", "InterposerCrashProbe"],
+            path: "Tests/MallocInterposerTests"
         ),
     ]
 )

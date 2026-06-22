@@ -29,6 +29,25 @@
 #include <stdio.h>
 #include <interposer.h>
 
+// The classifier reads the word *before* a user pointer, which AddressSanitizer
+// and ThreadSanitizer treat as out of bounds, so the global hooks are compiled
+// out under those sanitizers (a benchmarked process is never sanitized anyway).
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#    define MALLOC_INTERPOSER_SANITIZER 1
+#  endif
+#endif
+#if !defined(MALLOC_INTERPOSER_SANITIZER) && (defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__))
+#  define MALLOC_INTERPOSER_SANITIZER 1
+#endif
+#ifndef MALLOC_INTERPOSER_SANITIZER
+#  define MALLOC_INTERPOSER_SANITIZER 0
+#endif
+
+int malloc_interposer_global_hooks_installed(void) {
+    return !MALLOC_INTERPOSER_SANITIZER;
+}
+
 // ---------------------------------------------------------------------------
 // Counting model
 //
@@ -65,6 +84,10 @@ static counter_block_t *g_blocks_head = NULL;
 static counter_block_t g_dead_aggregate = {0};
 
 static _Thread_local counter_block_t *t_block = NULL;
+// Set while this thread is creating its counter block; if block creation itself
+// allocates, the nested count would otherwise recurse into tls_block_init and
+// deadlock on g_list_mutex.
+static _Thread_local bool t_initializing = false;
 static pthread_key_t g_block_key;
 static pthread_once_t g_key_once = PTHREAD_ONCE_INIT;
 
@@ -113,24 +136,30 @@ static void init_block_key(void) {
 }
 
 static __attribute__((noinline)) counter_block_t *tls_block_init(void) {
+    t_initializing = true;
     pthread_once(&g_key_once, init_block_key);
 
     counter_block_t *b = (counter_block_t *)calloc(1, sizeof(counter_block_t));
-    if (!b) return NULL;
-    pthread_setspecific(g_block_key, b);
+    if (b) {
+        pthread_setspecific(g_block_key, b);
 
-    pthread_mutex_lock(&g_list_mutex);
-    b->next = g_blocks_head;
-    g_blocks_head = b;
-    pthread_mutex_unlock(&g_list_mutex);
+        pthread_mutex_lock(&g_list_mutex);
+        b->next = g_blocks_head;
+        g_blocks_head = b;
+        pthread_mutex_unlock(&g_list_mutex);
 
-    t_block = b;
+        t_block = b;
+    }
+    t_initializing = false;
     return b;
 }
 
 static __attribute__((always_inline)) counter_block_t *get_tls_block(void) {
     counter_block_t *b = t_block;
     if (__builtin_expect(b == NULL, 0)) {
+        // A reentrant allocation while we're building the block must not recurse
+        // back in (that would deadlock on g_list_mutex); skip counting it.
+        if (t_initializing) return NULL;
         b = tls_block_init();
     }
     return b;
@@ -201,6 +230,13 @@ void malloc_interposer_get_stats(int64_t *malloc_count, int64_t *malloc_bytes,
 
 // Inline counting helpers ---------------------------------------------------
 //
+// Byte basis: `size` is whatever each path supplies — requested bytes on the
+// header-prefixed paths (malloc/calloc/realloc), and libc's usable size on the
+// aligned/legacy paths (valloc/posix_memalign/aligned_alloc) which can't carry
+// a header. A given allocation's alloc and free use the same basis, so the
+// delta metrics stay correct; only the gross byte total can read slightly high
+// for aligned allocations.
+//
 // All counter updates land in the calling thread's TLS block. The block is
 // created lazily on first use. Once the pointer is cached in the _Thread_local
 // slot, every subsequent call is a non-atomic increment on private memory.
@@ -209,8 +245,10 @@ static __attribute__((always_inline)) void count_malloc(size_t size) {
     counter_block_t *b = get_tls_block();
     if (__builtin_expect(b == NULL, 0)) return;
     b->malloc_bytes += (int64_t)size;
-    // Branchless small/large split — index 0 is small, 1 is large.
-    b->malloc_size_class[size > g_page_size]++;
+    // Branchless small/large split — index 0 is small, 1 is large. The boundary
+    // is a fixed constant (not the page size) so the split is architecture-
+    // independent; see MALLOC_INTERPOSER_LARGE_THRESHOLD.
+    b->malloc_size_class[size > MALLOC_INTERPOSER_LARGE_THRESHOLD]++;
 }
 
 static __attribute__((always_inline)) void count_free(size_t size) {
@@ -224,10 +262,11 @@ static __attribute__((always_inline)) void count_free(size_t size) {
 
 static __attribute__((always_inline)) void *write_header(void *raw, size_t size) {
     malloc_header_t *hdr = (malloc_header_t *)raw;
+    void *user = malloc_interposer_user_for(raw);
     hdr->requested_size = size;
-    hdr->reserved = 0;
+    hdr->addr_tag = malloc_interposer_addr_tag(user);
     hdr->magic = MALLOC_INTERPOSER_MAGIC;
-    return malloc_interposer_user_for(raw);
+    return user;
 }
 
 // Replacement functions -----------------------------------------------------
@@ -348,6 +387,14 @@ int replacement_posix_memalign(void **memptr, size_t alignment, size_t size) {
     return result;
 }
 
+void *replacement_aligned_alloc(size_t alignment, size_t size) {
+    void *ptr = aligned_alloc(alignment, size);
+    if (ptr && atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {
+        count_malloc(malloc_size(ptr));
+    }
+    return ptr;
+}
+
 // ---- Zone-level wrappers (rarely hit by user code) ------------------------
 
 void *replacement_malloc_zone_malloc(malloc_zone_t *zone, size_t size) {
@@ -438,16 +485,28 @@ void replacement_malloc_zone_free(malloc_zone_t *zone, void *user_ptr) {
 // ---- Size queries ---------------------------------------------------------
 // External code that calls malloc_size on one of our pointers would see the
 // offset address (not the libc chunk start), so libsystem can't find it in
-// any zone. Interpose to return the requested size from the header.
+// any zone. Interpose to report the usable capacity from the underlying block.
 
 size_t replacement_malloc_size(const void *user_ptr) {
     if (!user_ptr) return 0;
     if (malloc_interposer_is_ours(user_ptr)) {
-        return malloc_interposer_header_for((void *)user_ptr)->requested_size;
+        malloc_header_t *hdr = malloc_interposer_header_for((void *)user_ptr);
+        // Report the usable capacity the caller really has (libc's usable size
+        // of the underlying block, minus our header), not just the requested
+        // size — otherwise in-place growers like Swift Array/ManagedBuffer
+        // never see the spare room and reallocate sooner than they would
+        // natively, perturbing the allocation pattern being measured. Never
+        // report less than was requested.
+        size_t raw_usable = malloc_size(hdr);
+        size_t user_usable = raw_usable > sizeof(malloc_header_t)
+                                 ? raw_usable - sizeof(malloc_header_t)
+                                 : 0;
+        return user_usable > hdr->requested_size ? user_usable : hdr->requested_size;
     }
     return malloc_size(user_ptr);
 }
 
+#if !MALLOC_INTERPOSER_SANITIZER
 DYLD_INTERPOSE(replacement_free, free)
 DYLD_INTERPOSE(replacement_malloc, malloc)
 DYLD_INTERPOSE(replacement_realloc, realloc)
@@ -455,6 +514,7 @@ DYLD_INTERPOSE(replacement_calloc, calloc)
 DYLD_INTERPOSE(replacement_reallocf, reallocf)
 DYLD_INTERPOSE(replacement_valloc, valloc)
 DYLD_INTERPOSE(replacement_posix_memalign, posix_memalign)
+DYLD_INTERPOSE(replacement_aligned_alloc, aligned_alloc)
 DYLD_INTERPOSE(replacement_malloc_size, malloc_size)
 DYLD_INTERPOSE(replacement_malloc_zone_malloc, malloc_zone_malloc)
 DYLD_INTERPOSE(replacement_malloc_zone_calloc, malloc_zone_calloc)
@@ -462,4 +522,5 @@ DYLD_INTERPOSE(replacement_malloc_zone_valloc, malloc_zone_valloc)
 DYLD_INTERPOSE(replacement_malloc_zone_realloc, malloc_zone_realloc)
 DYLD_INTERPOSE(replacement_malloc_zone_memalign, malloc_zone_memalign)
 DYLD_INTERPOSE(replacement_malloc_zone_free, malloc_zone_free)
+#endif
 #endif

@@ -28,10 +28,30 @@
 
 #include <interposer.h>
 
+// The classifier reads the word *before* a user pointer, which AddressSanitizer
+// and ThreadSanitizer treat as out of bounds, so the global malloc overrides
+// are compiled out under those sanitizers (a benchmarked process is never
+// sanitized anyway).
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#    define MALLOC_INTERPOSER_SANITIZER 1
+#  endif
+#endif
+#if !defined(MALLOC_INTERPOSER_SANITIZER) && (defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__))
+#  define MALLOC_INTERPOSER_SANITIZER 1
+#endif
+#ifndef MALLOC_INTERPOSER_SANITIZER
+#  define MALLOC_INTERPOSER_SANITIZER 0
+#endif
+
+int malloc_interposer_global_hooks_installed(void) {
+    return !MALLOC_INTERPOSER_SANITIZER;
+}
+
 /* a big block of memory that we'll use for recursive mallocs */
 static char g_recursive_malloc_mem[10 * 1024 * 1024] = {0};
 /* the index of the first free byte */
-static _Atomic ptrdiff_t g_recursive_malloc_next_free_ptr = ATOMIC_VAR_INIT(0);
+static _Atomic ptrdiff_t g_recursive_malloc_next_free_ptr = 0;
 
 #define LIBC_SYMBOL(_fun) "" # _fun
 
@@ -44,9 +64,14 @@ static __thread bool g_in_socket = false;
 static __thread bool g_in_accept = false;
 static __thread bool g_in_accept4 = false;
 static __thread bool g_in_close = false;
+static __thread bool g_in_posix_memalign = false;
+static __thread bool g_in_aligned_alloc = false;
+static __thread bool g_in_memalign = false;
+static __thread bool g_in_calloc = false;
 
 /* The types of the variables holding the libc function pointers. */
 typedef void   *(*type_libc_malloc)(size_t);
+typedef void   *(*type_libc_calloc)(size_t, size_t);
 typedef void   *(*type_libc_realloc)(void *, size_t);
 typedef void    (*type_libc_free)(void *);
 typedef size_t  (*type_libc_malloc_usable_size)(void *);
@@ -54,9 +79,13 @@ typedef int     (*type_libc_socket)(int, int, int);
 typedef int     (*type_libc_accept)(int, struct sockaddr*, socklen_t *);
 typedef int     (*type_libc_accept4)(int, struct sockaddr *, socklen_t *, int);
 typedef int     (*type_libc_close)(int);
+typedef int     (*type_libc_posix_memalign)(void **, size_t, size_t);
+typedef void   *(*type_libc_aligned_alloc)(size_t, size_t);
+typedef void   *(*type_libc_memalign)(size_t, size_t);
 
 /* The (atomic) globals holding the pointer to the original libc implementation. */
 _Atomic type_libc_malloc g_libc_malloc;
+_Atomic type_libc_calloc g_libc_calloc;
 _Atomic type_libc_realloc g_libc_realloc;
 _Atomic type_libc_free g_libc_free;
 _Atomic type_libc_malloc_usable_size g_libc_malloc_usable_size;
@@ -64,6 +93,9 @@ _Atomic type_libc_socket g_libc_socket;
 _Atomic type_libc_accept g_libc_accept;
 _Atomic type_libc_accept4 g_libc_accept4;
 _Atomic type_libc_close g_libc_close;
+_Atomic type_libc_posix_memalign g_libc_posix_memalign;
+_Atomic type_libc_aligned_alloc g_libc_aligned_alloc;
+_Atomic type_libc_memalign g_libc_memalign;
 
 // ---------------------------------------------------------------------------
 // Counting model
@@ -105,6 +137,10 @@ static counter_block_t *g_blocks_head = NULL;
 static counter_block_t g_dead_aggregate = {0};
 
 static __thread counter_block_t *t_block = NULL;
+// Set while this thread is creating its counter block; if block creation itself
+// allocates, the nested count would otherwise recurse into tls_block_init and
+// deadlock on g_list_mutex.
+static __thread bool t_initializing = false;
 static pthread_key_t g_block_key;
 static pthread_once_t g_key_once = PTHREAD_ONCE_INIT;
 
@@ -180,24 +216,30 @@ static void init_block_key(void) {
 }
 
 static __attribute__((noinline)) counter_block_t *tls_block_init(void) {
+    t_initializing = true;
     pthread_once(&g_key_once, init_block_key);
 
     counter_block_t *b = (counter_block_t *)libc_calloc_block(sizeof(counter_block_t));
-    if (!b) return NULL;
-    pthread_setspecific(g_block_key, b);
+    if (b) {
+        pthread_setspecific(g_block_key, b);
 
-    pthread_mutex_lock(&g_list_mutex);
-    b->next = g_blocks_head;
-    g_blocks_head = b;
-    pthread_mutex_unlock(&g_list_mutex);
+        pthread_mutex_lock(&g_list_mutex);
+        b->next = g_blocks_head;
+        g_blocks_head = b;
+        pthread_mutex_unlock(&g_list_mutex);
 
-    t_block = b;
+        t_block = b;
+    }
+    t_initializing = false;
     return b;
 }
 
 static __attribute__((always_inline)) counter_block_t *get_tls_block(void) {
     counter_block_t *b = t_block;
     if (__builtin_expect(b == NULL, 0)) {
+        // A reentrant allocation while we're building the block must not recurse
+        // back in (that would deadlock on g_list_mutex); skip counting it.
+        if (t_initializing) return NULL;
         b = tls_block_init();
     }
     return b;
@@ -326,6 +368,28 @@ static int recursive_close(int fildes) {
     (void)fildes;
     abort();
 }
+// The aligned allocators are never needed to resolve libc symbols; if we
+// somehow re-enter during the dlsym handshake, fail the allocation rather than
+// recurse.
+static int recursive_posix_memalign(void **memptr, size_t alignment, size_t size) {
+    (void)memptr; (void)alignment; (void)size;
+    return ENOMEM;
+}
+static void *recursive_aligned_alloc(size_t alignment, size_t size) {
+    (void)alignment; (void)size;
+    return NULL;
+}
+static void *recursive_memalign(size_t alignment, size_t size) {
+    (void)alignment; (void)size;
+    return NULL;
+}
+// calloc may be called during the dlsym handshake; the recursive bump allocator
+// vends from zero-initialized BSS, so its blocks are already zeroed.
+static void *recursive_calloc(size_t count, size_t size) {
+    size_t total;
+    if (__builtin_mul_overflow(count, size, &total)) return NULL;
+    return recursive_malloc(total);
+}
 
 #define JUMP_INTO_LIBC_FUN(_fun, ...) /* \
 */ do { /* \
@@ -371,6 +435,13 @@ static int recursive_close(int fildes) {
 
 // Inline counting helpers ---------------------------------------------------
 //
+// Byte basis: `size` is whatever each path supplies — requested bytes on the
+// header-prefixed paths (malloc/calloc/realloc), and libc's usable size on the
+// aligned/legacy paths (valloc/posix_memalign/aligned_alloc/memalign) which
+// can't carry a header. A given allocation's alloc and free use the same basis,
+// so the delta metrics stay correct; only the gross byte total can read
+// slightly high for aligned allocations.
+//
 // All counter updates land in the calling thread's TLS block. The block is
 // created lazily on first use. Once the pointer is cached in the
 // thread-local slot, every subsequent call is a non-atomic increment on
@@ -380,8 +451,10 @@ static __attribute__((always_inline)) void count_malloc(size_t size) {
     counter_block_t *b = get_tls_block();
     if (__builtin_expect(b == NULL, 0)) return;
     b->malloc_bytes += (int64_t)size;
-    // Branchless small/large split — index 0 is small, 1 is large.
-    b->malloc_size_class[size > g_page_size]++;
+    // Branchless small/large split — index 0 is small, 1 is large. The boundary
+    // is a fixed constant (not the page size) so the split is architecture-
+    // independent; see MALLOC_INTERPOSER_LARGE_THRESHOLD.
+    b->malloc_size_class[size > MALLOC_INTERPOSER_LARGE_THRESHOLD]++;
 }
 
 static __attribute__((always_inline)) void count_free(size_t size) {
@@ -395,10 +468,11 @@ static __attribute__((always_inline)) void count_free(size_t size) {
 
 static __attribute__((always_inline)) void *write_header(void *raw, size_t size) {
     malloc_header_t *hdr = (malloc_header_t *)raw;
+    void *user = malloc_interposer_user_for(raw);
     hdr->requested_size = size;
-    hdr->reserved = 0;
+    hdr->addr_tag = malloc_interposer_addr_tag(user);
     hdr->magic = MALLOC_INTERPOSER_MAGIC;
-    return malloc_interposer_user_for(raw);
+    return user;
 }
 
 // Replacement functions -----------------------------------------------------
@@ -482,11 +556,16 @@ __attribute__((flatten)) void *replacement_calloc(size_t count, size_t size) {
         errno = ENOMEM;
         return NULL;
     }
-    void *user_ptr = replacement_malloc(total);
-    if (user_ptr) {
-        memset(user_ptr, 0, total);
+    // Allocate the underlying block with libc calloc (not malloc+memset) so a
+    // large allocation keeps libc's demand-zeroed pages instead of being eagerly
+    // faulted in by memset; we then overwrite just the 16-byte header.
+    void *raw;
+    CALL_LIBC_FUN_CAPTURE(raw, calloc, 1, total + sizeof(malloc_header_t));
+    if (!raw) return NULL;
+    if (atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {
+        count_malloc(total);
     }
-    return user_ptr;
+    return write_header(raw, total);
 }
 
 void *replacement_reallocf(void *user_ptr, size_t new_size) {
@@ -497,23 +576,53 @@ void *replacement_reallocf(void *user_ptr, size_t new_size) {
     return new_ptr;
 }
 
-// Aligned/legacy paths skip the header (alignment requirements rule it out)
-// and rely on malloc_usable_size for byte accounting.
-
-void *replacement_valloc(size_t size) {
-    // Note: not aligning correctly (should be PAGE_SIZE) but good enough.
-    return replacement_malloc(size);
-}
+// Aligned/legacy paths can't carry our size header: the 16-byte prefix would
+// shift the user pointer off the requested alignment. We let libc place a
+// correctly-aligned (header-less) chunk and account it via malloc_usable_size;
+// the magic probe on free fails for these, routing them through the external
+// path (which also bills them via malloc_usable_size, so alloc/free balance).
 
 int replacement_posix_memalign(void **memptr, size_t alignment, size_t size) {
-    (void)alignment;
-    // Note: not aligning correctly (should be `alignment`) but good enough.
-    void *ptr = replacement_malloc(size);
-    if (ptr && memptr) {
-        *memptr = ptr;
-        return 0;
+    if (!memptr) return EINVAL;
+    int result;
+    CALL_LIBC_FUN_CAPTURE(result, posix_memalign, memptr, alignment, size);
+    if (result == 0 && *memptr
+        && atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {
+        size_t usable;
+        CALL_LIBC_FUN_CAPTURE(usable, malloc_usable_size, *memptr);
+        count_malloc(usable);
     }
-    return ENOMEM;
+    return result;
+}
+
+void *replacement_valloc(size_t size) {
+    void *ptr = NULL;
+    if (replacement_posix_memalign(&ptr, (size_t)g_page_size, size) != 0) {
+        return NULL;
+    }
+    return ptr;
+}
+
+void *replacement_aligned_alloc(size_t alignment, size_t size) {
+    void *ptr;
+    CALL_LIBC_FUN_CAPTURE(ptr, aligned_alloc, alignment, size);
+    if (ptr && atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {
+        size_t usable;
+        CALL_LIBC_FUN_CAPTURE(usable, malloc_usable_size, ptr);
+        count_malloc(usable);
+    }
+    return ptr;
+}
+
+void *replacement_memalign(size_t alignment, size_t size) {
+    void *ptr;
+    CALL_LIBC_FUN_CAPTURE(ptr, memalign, alignment, size);
+    if (ptr && atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {
+        size_t usable;
+        CALL_LIBC_FUN_CAPTURE(usable, malloc_usable_size, ptr);
+        count_malloc(usable);
+    }
+    return ptr;
 }
 
 // Size queries --------------------------------------------------------------
@@ -526,7 +635,19 @@ int replacement_posix_memalign(void **memptr, size_t alignment, size_t size) {
 size_t replacement_malloc_usable_size(void *user_ptr) {
     if (!user_ptr) return 0;
     if (malloc_interposer_is_ours(user_ptr)) {
-        return malloc_interposer_header_for(user_ptr)->requested_size;
+        malloc_header_t *hdr = malloc_interposer_header_for(user_ptr);
+        // Report the usable capacity the caller really has (libc's usable size
+        // of the underlying block, minus our header), not just the requested
+        // size — otherwise in-place growers like Swift Array/ManagedBuffer
+        // never see the spare room and reallocate sooner than they would
+        // natively, perturbing the allocation pattern being measured. Never
+        // report less than was requested.
+        size_t raw_usable;
+        CALL_LIBC_FUN_CAPTURE(raw_usable, malloc_usable_size, hdr);
+        size_t user_usable = raw_usable > sizeof(malloc_header_t)
+                                 ? raw_usable - sizeof(malloc_header_t)
+                                 : 0;
+        return user_usable > hdr->requested_size ? user_usable : hdr->requested_size;
     }
     size_t size;
     CALL_LIBC_FUN_CAPTURE(size, malloc_usable_size, user_ptr);
@@ -535,6 +656,7 @@ size_t replacement_malloc_usable_size(void *user_ptr) {
 
 // Public symbol overrides ---------------------------------------------------
 
+#if !MALLOC_INTERPOSER_SANITIZER
 void free(void *ptr) { replacement_free(ptr); }
 void *malloc(size_t size) { return replacement_malloc(size); }
 void *calloc(size_t nmemb, size_t size) { return replacement_calloc(nmemb, size); }
@@ -544,6 +666,9 @@ void *valloc(size_t size) { return replacement_valloc(size); }
 int posix_memalign(void **memptr, size_t alignment, size_t size) {
     return replacement_posix_memalign(memptr, alignment, size);
 }
+void *aligned_alloc(size_t alignment, size_t size) { return replacement_aligned_alloc(alignment, size); }
+void *memalign(size_t alignment, size_t size) { return replacement_memalign(alignment, size); }
 size_t malloc_usable_size(void *ptr) { return replacement_malloc_usable_size(ptr); }
+#endif
 
 #endif

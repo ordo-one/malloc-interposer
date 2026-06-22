@@ -37,9 +37,15 @@
 
 #define MALLOC_INTERPOSER_MAGIC 0xC0FFEE5AU
 
+// Fixed small/large boundary (16 KiB). Using a constant instead of the runtime
+// page size keeps the small/large split architecture-independent (x86 4 KiB vs
+// arm64 16 KiB pages would otherwise classify the same allocation differently)
+// and approximates jemalloc's small/large size-class boundary.
+#define MALLOC_INTERPOSER_LARGE_THRESHOLD ((size_t)16384)
+
 typedef struct {
     size_t   requested_size; // offset 0
-    uint32_t reserved;       // offset 8
+    uint32_t addr_tag;       // offset 8  — address-keyed tag, paired with magic
     uint32_t magic;          // offset 12 — last 4 bytes for fast probe via *(user_ptr - 4)
 } malloc_header_t;
 
@@ -54,14 +60,39 @@ static inline void *malloc_interposer_user_for(void *raw) {
     return (char *)raw + sizeof(malloc_header_t);
 }
 
+// A cheap address-keyed tag stored alongside the magic. The magic alone matches
+// unrelated memory ~1 in 2^32; requiring the preceding word to also equal a hash
+// of *this* pointer's address makes a false positive astronomically unlikely —
+// which matters because a false positive frees the wrong address.
+static inline uint32_t malloc_interposer_addr_tag(const void *user_ptr) {
+    uintptr_t addr = (uintptr_t)user_ptr;
+    addr *= 0x9E3779B97F4A7C15ULL; // golden-ratio mix
+    return (uint32_t)(addr >> 32) ^ MALLOC_INTERPOSER_MAGIC;
+}
+
 static inline bool malloc_interposer_is_ours(const void *user_ptr) {
     if (!user_ptr) return false;
-    // Probe the last 4 bytes of the would-be header. For our pointers this
-    // reads our magic; for external pointers it reads into libc chunk
-    // metadata (always present and readable for libc-malloc'd pointers).
-    uint32_t magic;
-    memcpy(&magic, (const char *)user_ptr - sizeof(uint32_t), sizeof(magic));
-    return magic == MALLOC_INTERPOSER_MAGIC;
+#if __APPLE__
+    // The probe below reads the 8 bytes *before* user_ptr. For our own pointers
+    // those bytes are our header, always mapped. For a page-aligned pointer,
+    // though, they fall in the *previous* page — and libc valloc / large
+    // posix_memalign hand back page-aligned pointers backed by a fresh mmap
+    // whose preceding page is unmapped, so the probe would fault.
+    //
+    // Such allocations are libc allocation *starts*, which malloc_zone_from_ptr
+    // resolves to a zone; our pointers are interior (raw + header) and resolve
+    // to NULL, so they still fall through to the probe (their preceding page
+    // holds our header and is mapped). Gate on 4096 — the smallest page size —
+    // to keep the zone lookup off the hot path for the common case.
+    if (((uintptr_t)user_ptr & 0xFFFU) == 0 && malloc_zone_from_ptr(user_ptr) != NULL) {
+        return false;
+    }
+#endif
+    // Read the tag (offset 8) and magic (offset 12) in one go.
+    uint32_t fields[2]; // fields[0] = addr_tag, fields[1] = magic
+    memcpy(fields, (const char *)user_ptr - 2 * sizeof(uint32_t), sizeof(fields));
+    return fields[1] == MALLOC_INTERPOSER_MAGIC
+        && fields[0] == malloc_interposer_addr_tag(user_ptr);
 }
 
 // ---------------------------------------------------------------------------
@@ -122,6 +153,16 @@ void malloc_interposer_get_stats(int64_t *malloc_count, int64_t *malloc_bytes,
                                  int64_t *malloc_small, int64_t *malloc_large,
                                  int64_t *free_count, int64_t *free_bytes);
 
+/**
+ * Whether the global malloc hooks are compiled in (non-zero) or not (zero).
+ *
+ * The classifier probes the word *before* a user pointer, which AddressSanitizer
+ * and ThreadSanitizer treat as an out-of-bounds access, so the global hooks are
+ * compiled out under those sanitizers. Tests that drive the hooks directly use
+ * this to skip themselves in sanitizer builds.
+ */
+int malloc_interposer_global_hooks_installed(void);
+
 // Replacement functions (used internally for DYLD_INTERPOSE and Linux overrides)
 void *replacement_malloc(size_t size);
 void replacement_free(void *ptr);
@@ -130,9 +171,11 @@ void *replacement_realloc(void *ptr, size_t size);
 void *replacement_reallocf(void *ptr, size_t size);
 void *replacement_valloc(size_t size);
 int replacement_posix_memalign(void **memptr, size_t alignment, size_t size);
+void *replacement_aligned_alloc(size_t alignment, size_t size);
 #if __APPLE__
 size_t replacement_malloc_size(const void *ptr);
 #else
+void *replacement_memalign(size_t alignment, size_t size);
 size_t replacement_malloc_usable_size(void *ptr);
 #endif
 
@@ -146,6 +189,8 @@ void *realloc(void *ptr, size_t size);
 void *reallocf(void *ptr, size_t size);
 void *valloc(size_t size);
 int posix_memalign(void **memptr, size_t alignment, size_t size);
+void *aligned_alloc(size_t alignment, size_t size);
+void *memalign(size_t alignment, size_t size);
 size_t malloc_usable_size(void *ptr);
 #endif
 
