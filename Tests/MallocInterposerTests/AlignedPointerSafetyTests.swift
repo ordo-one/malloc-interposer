@@ -203,28 +203,30 @@ struct AlignedPointerSafetyTests {
         )
     }
 
-    // MARK: Item C — calloc returns zeroed, counted memory
+    // MARK: Item C — calloc returns zeroed memory and is counted
 
-    /// Switching Linux calloc from malloc+memset to libc calloc must preserve
-    /// behavior: zeroed memory, counted as one allocation. (Regression guard; the
-    /// change itself is a page-fault/perf improvement with no visible delta.)
+    /// Switching Linux calloc from malloc+memset to libc calloc must still
+    /// return zeroed memory. (Regression guard; the change itself is a
+    /// page-fault/perf improvement with no visible delta.)
     @Test
-    func callocReturnsZeroedCountedMemory() throws {
+    func callocReturnsZeroedMemory() throws {
         let count = 256, size = 8
-        malloc_interposer_reset()
-        malloc_interposer_enable()
-        let before = currentCounts()
         let pointer = try #require(replacement_calloc(count, size), "calloc failed")
-        let after = currentCounts()
+        defer { replacement_free(pointer) }
         var allZero = true
         for offset in 0 ..< (count * size) where pointer.load(fromByteOffset: offset, as: UInt8.self) != 0 {
             allZero = false
             break
         }
-        replacement_free(pointer)
-        malloc_interposer_disable()
         #expect(allZero, "calloc memory must be zeroed")
-        #expect(after.malloc - before.malloc == 1, "calloc must count as one allocation")
+    }
+
+    /// calloc must be counted as an allocation. Uses the loop helper rather than
+    /// a single `== 1` delta, since the counters are process-global and a tight
+    /// snapshot picks up unrelated background allocations.
+    @Test
+    func callocIsCounted() {
+        assertAllocationsAreCounted { replacement_calloc(1, 64) }
     }
 
     /// Runs `allocate` in a loop with counting enabled and asserts both the
