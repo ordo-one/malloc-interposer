@@ -65,6 +65,8 @@ static __thread bool g_in_accept = false;
 static __thread bool g_in_accept4 = false;
 static __thread bool g_in_close = false;
 static __thread bool g_in_posix_memalign = false;
+static __thread bool g_in_aligned_alloc = false;
+static __thread bool g_in_memalign = false;
 
 /* The types of the variables holding the libc function pointers. */
 typedef void   *(*type_libc_malloc)(size_t);
@@ -76,6 +78,8 @@ typedef int     (*type_libc_accept)(int, struct sockaddr*, socklen_t *);
 typedef int     (*type_libc_accept4)(int, struct sockaddr *, socklen_t *, int);
 typedef int     (*type_libc_close)(int);
 typedef int     (*type_libc_posix_memalign)(void **, size_t, size_t);
+typedef void   *(*type_libc_aligned_alloc)(size_t, size_t);
+typedef void   *(*type_libc_memalign)(size_t, size_t);
 
 /* The (atomic) globals holding the pointer to the original libc implementation. */
 _Atomic type_libc_malloc g_libc_malloc;
@@ -87,6 +91,8 @@ _Atomic type_libc_accept g_libc_accept;
 _Atomic type_libc_accept4 g_libc_accept4;
 _Atomic type_libc_close g_libc_close;
 _Atomic type_libc_posix_memalign g_libc_posix_memalign;
+_Atomic type_libc_aligned_alloc g_libc_aligned_alloc;
+_Atomic type_libc_memalign g_libc_memalign;
 
 // ---------------------------------------------------------------------------
 // Counting model
@@ -349,11 +355,20 @@ static int recursive_close(int fildes) {
     (void)fildes;
     abort();
 }
-// posix_memalign is never needed to resolve libc symbols; if we somehow
-// re-enter during the dlsym handshake, fail the allocation rather than recurse.
+// The aligned allocators are never needed to resolve libc symbols; if we
+// somehow re-enter during the dlsym handshake, fail the allocation rather than
+// recurse.
 static int recursive_posix_memalign(void **memptr, size_t alignment, size_t size) {
     (void)memptr; (void)alignment; (void)size;
     return ENOMEM;
+}
+static void *recursive_aligned_alloc(size_t alignment, size_t size) {
+    (void)alignment; (void)size;
+    return NULL;
+}
+static void *recursive_memalign(size_t alignment, size_t size) {
+    (void)alignment; (void)size;
+    return NULL;
 }
 
 #define JUMP_INTO_LIBC_FUN(_fun, ...) /* \
@@ -553,6 +568,28 @@ void *replacement_valloc(size_t size) {
     return ptr;
 }
 
+void *replacement_aligned_alloc(size_t alignment, size_t size) {
+    void *ptr;
+    CALL_LIBC_FUN_CAPTURE(ptr, aligned_alloc, alignment, size);
+    if (ptr && atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {
+        size_t usable;
+        CALL_LIBC_FUN_CAPTURE(usable, malloc_usable_size, ptr);
+        count_malloc(usable);
+    }
+    return ptr;
+}
+
+void *replacement_memalign(size_t alignment, size_t size) {
+    void *ptr;
+    CALL_LIBC_FUN_CAPTURE(ptr, memalign, alignment, size);
+    if (ptr && atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {
+        size_t usable;
+        CALL_LIBC_FUN_CAPTURE(usable, malloc_usable_size, ptr);
+        count_malloc(usable);
+    }
+    return ptr;
+}
+
 // Size queries --------------------------------------------------------------
 //
 // External callers may pass our pointers to malloc_usable_size; libc would
@@ -582,6 +619,8 @@ void *valloc(size_t size) { return replacement_valloc(size); }
 int posix_memalign(void **memptr, size_t alignment, size_t size) {
     return replacement_posix_memalign(memptr, alignment, size);
 }
+void *aligned_alloc(size_t alignment, size_t size) { return replacement_aligned_alloc(alignment, size); }
+void *memalign(size_t alignment, size_t size) { return replacement_memalign(alignment, size); }
 size_t malloc_usable_size(void *ptr) { return replacement_malloc_usable_size(ptr); }
 #endif
 

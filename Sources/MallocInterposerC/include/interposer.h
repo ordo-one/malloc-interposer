@@ -153,9 +153,11 @@ void *replacement_realloc(void *ptr, size_t size);
 void *replacement_reallocf(void *ptr, size_t size);
 void *replacement_valloc(size_t size);
 int replacement_posix_memalign(void **memptr, size_t alignment, size_t size);
+void *replacement_aligned_alloc(size_t alignment, size_t size);
 #if __APPLE__
 size_t replacement_malloc_size(const void *ptr);
 #else
+void *replacement_memalign(size_t alignment, size_t size);
 size_t replacement_malloc_usable_size(void *ptr);
 #endif
 
@@ -169,6 +171,8 @@ void *realloc(void *ptr, size_t size);
 void *reallocf(void *ptr, size_t size);
 void *valloc(size_t size);
 int posix_memalign(void **memptr, size_t alignment, size_t size);
+void *aligned_alloc(size_t alignment, size_t size);
+void *memalign(size_t alignment, size_t size);
 size_t malloc_usable_size(void *ptr);
 #endif
 

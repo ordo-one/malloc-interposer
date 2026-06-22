@@ -367,6 +367,14 @@ int replacement_posix_memalign(void **memptr, size_t alignment, size_t size) {
     return result;
 }
 
+void *replacement_aligned_alloc(size_t alignment, size_t size) {
+    void *ptr = aligned_alloc(alignment, size);
+    if (ptr && atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {
+        count_malloc(malloc_size(ptr));
+    }
+    return ptr;
+}
+
 // ---- Zone-level wrappers (rarely hit by user code) ------------------------
 
 void *replacement_malloc_zone_malloc(malloc_zone_t *zone, size_t size) {
@@ -475,6 +483,7 @@ DYLD_INTERPOSE(replacement_calloc, calloc)
 DYLD_INTERPOSE(replacement_reallocf, reallocf)
 DYLD_INTERPOSE(replacement_valloc, valloc)
 DYLD_INTERPOSE(replacement_posix_memalign, posix_memalign)
+DYLD_INTERPOSE(replacement_aligned_alloc, aligned_alloc)
 DYLD_INTERPOSE(replacement_malloc_size, malloc_size)
 DYLD_INTERPOSE(replacement_malloc_zone_malloc, malloc_zone_malloc)
 DYLD_INTERPOSE(replacement_malloc_zone_calloc, malloc_zone_calloc)

@@ -117,4 +117,65 @@ final class AlignedPointerSafetyTests: XCTestCase {
         )
         replacement_free(pointer)
     }
+
+    // MARK: Issue 8 — aligned allocators must be counted
+
+    /// `aligned_alloc` was not intercepted, so its allocations were invisible to
+    /// the counters while their frees still counted — an unbalanced malloc/free
+    /// delta. Each alloc/free pair must move both counters.
+    func testAlignedAllocIsCounted() {
+        assertAllocationsAreCounted {
+            replacement_aligned_alloc(64, 1_024)
+        }
+    }
+
+    #if !canImport(Darwin)
+        /// `memalign` (glibc) had the same gap as `aligned_alloc`.
+        func testMemalignIsCounted() {
+            assertAllocationsAreCounted {
+                replacement_memalign(64, 1_024)
+            }
+        }
+    #endif
+
+    /// Runs `allocate` in a loop with counting enabled and asserts both the
+    /// malloc and free counters advanced by at least the iteration count.
+    /// Counting is process-global, so background allocations only ever *add* to
+    /// the deltas — a large loop keeps the signal well clear of that noise.
+    private func assertAllocationsAreCounted(
+        _ allocate: () -> UnsafeMutableRawPointer?,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let iterations = 4_096
+        malloc_interposer_reset()
+        malloc_interposer_enable()
+        let before = currentCounts()
+        for _ in 0 ..< iterations {
+            if let pointer = allocate() {
+                replacement_free(pointer)
+            }
+        }
+        let after = currentCounts()
+        malloc_interposer_disable()
+
+        XCTAssertGreaterThanOrEqual(
+            after.malloc - before.malloc, Int64(iterations),
+            "allocations were not counted", file: file, line: line
+        )
+        XCTAssertGreaterThanOrEqual(
+            after.free - before.free, Int64(iterations),
+            "frees were not counted", file: file, line: line
+        )
+    }
+
+    private func currentCounts() -> (malloc: Int64, free: Int64) {
+        var mallocCount: Int64 = 0, mallocBytes: Int64 = 0
+        var mallocSmall: Int64 = 0, mallocLarge: Int64 = 0
+        var freeCount: Int64 = 0, freeBytes: Int64 = 0
+        malloc_interposer_get_stats(
+            &mallocCount, &mallocBytes, &mallocSmall, &mallocLarge, &freeCount, &freeBytes
+        )
+        return (mallocCount, freeCount)
+    }
 }
