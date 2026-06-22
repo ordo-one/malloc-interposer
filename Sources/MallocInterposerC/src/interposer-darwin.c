@@ -465,12 +465,23 @@ void replacement_malloc_zone_free(malloc_zone_t *zone, void *user_ptr) {
 // ---- Size queries ---------------------------------------------------------
 // External code that calls malloc_size on one of our pointers would see the
 // offset address (not the libc chunk start), so libsystem can't find it in
-// any zone. Interpose to return the requested size from the header.
+// any zone. Interpose to report the usable capacity from the underlying block.
 
 size_t replacement_malloc_size(const void *user_ptr) {
     if (!user_ptr) return 0;
     if (malloc_interposer_is_ours(user_ptr)) {
-        return malloc_interposer_header_for((void *)user_ptr)->requested_size;
+        malloc_header_t *hdr = malloc_interposer_header_for((void *)user_ptr);
+        // Report the usable capacity the caller really has (libc's usable size
+        // of the underlying block, minus our header), not just the requested
+        // size — otherwise in-place growers like Swift Array/ManagedBuffer
+        // never see the spare room and reallocate sooner than they would
+        // natively, perturbing the allocation pattern being measured. Never
+        // report less than was requested.
+        size_t raw_usable = malloc_size(hdr);
+        size_t user_usable = raw_usable > sizeof(malloc_header_t)
+                                 ? raw_usable - sizeof(malloc_header_t)
+                                 : 0;
+        return user_usable > hdr->requested_size ? user_usable : hdr->requested_size;
     }
     return malloc_size(user_ptr);
 }

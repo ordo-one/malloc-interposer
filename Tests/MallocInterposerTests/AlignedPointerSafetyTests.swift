@@ -118,6 +118,29 @@ final class AlignedPointerSafetyTests: XCTestCase {
         replacement_free(pointer)
     }
 
+    // MARK: Finding A — size queries must report usable capacity
+
+    /// `malloc_size` / `malloc_usable_size` previously returned the *requested*
+    /// size, so callers that grow in place (Swift Array/ManagedBuffer) never saw
+    /// the spare capacity libc actually handed out. A size query must report the
+    /// usable capacity, which for a deliberately rounded-up request exceeds it.
+    func testSizeQueryReportsUsableCapacityNotRequested() {
+        let requested = 1 // a 1-byte request always rounds up to a larger block
+        guard let pointer = replacement_malloc(requested) else {
+            return XCTFail("malloc failed")
+        }
+        defer { replacement_free(pointer) }
+        #if canImport(Darwin)
+            let reported = replacement_malloc_size(pointer)
+        #else
+            let reported = replacement_malloc_usable_size(pointer)
+        #endif
+        XCTAssertGreaterThan(
+            reported, requested,
+            "size query must report usable capacity, not the requested size"
+        )
+    }
+
     // MARK: Issue 8 — aligned allocators must be counted
 
     /// `aligned_alloc` was not intercepted, so its allocations were invisible to

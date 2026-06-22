@@ -600,7 +600,19 @@ void *replacement_memalign(size_t alignment, size_t size) {
 size_t replacement_malloc_usable_size(void *user_ptr) {
     if (!user_ptr) return 0;
     if (malloc_interposer_is_ours(user_ptr)) {
-        return malloc_interposer_header_for(user_ptr)->requested_size;
+        malloc_header_t *hdr = malloc_interposer_header_for(user_ptr);
+        // Report the usable capacity the caller really has (libc's usable size
+        // of the underlying block, minus our header), not just the requested
+        // size — otherwise in-place growers like Swift Array/ManagedBuffer
+        // never see the spare room and reallocate sooner than they would
+        // natively, perturbing the allocation pattern being measured. Never
+        // report less than was requested.
+        size_t raw_usable;
+        CALL_LIBC_FUN_CAPTURE(raw_usable, malloc_usable_size, hdr);
+        size_t user_usable = raw_usable > sizeof(malloc_header_t)
+                                 ? raw_usable - sizeof(malloc_header_t)
+                                 : 0;
+        return user_usable > hdr->requested_size ? user_usable : hdr->requested_size;
     }
     size_t size;
     CALL_LIBC_FUN_CAPTURE(size, malloc_usable_size, user_ptr);
