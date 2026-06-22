@@ -29,6 +29,25 @@
 #include <stdio.h>
 #include <interposer.h>
 
+// The classifier reads the word *before* a user pointer, which AddressSanitizer
+// and ThreadSanitizer treat as out of bounds, so the global hooks are compiled
+// out under those sanitizers (a benchmarked process is never sanitized anyway).
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#    define MALLOC_INTERPOSER_SANITIZER 1
+#  endif
+#endif
+#if !defined(MALLOC_INTERPOSER_SANITIZER) && (defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__))
+#  define MALLOC_INTERPOSER_SANITIZER 1
+#endif
+#ifndef MALLOC_INTERPOSER_SANITIZER
+#  define MALLOC_INTERPOSER_SANITIZER 0
+#endif
+
+int malloc_interposer_global_hooks_installed(void) {
+    return !MALLOC_INTERPOSER_SANITIZER;
+}
+
 // ---------------------------------------------------------------------------
 // Counting model
 //
@@ -448,6 +467,7 @@ size_t replacement_malloc_size(const void *user_ptr) {
     return malloc_size(user_ptr);
 }
 
+#if !MALLOC_INTERPOSER_SANITIZER
 DYLD_INTERPOSE(replacement_free, free)
 DYLD_INTERPOSE(replacement_malloc, malloc)
 DYLD_INTERPOSE(replacement_realloc, realloc)
@@ -462,4 +482,5 @@ DYLD_INTERPOSE(replacement_malloc_zone_valloc, malloc_zone_valloc)
 DYLD_INTERPOSE(replacement_malloc_zone_realloc, malloc_zone_realloc)
 DYLD_INTERPOSE(replacement_malloc_zone_memalign, malloc_zone_memalign)
 DYLD_INTERPOSE(replacement_malloc_zone_free, malloc_zone_free)
+#endif
 #endif

@@ -40,5 +40,20 @@ let package = Package(
             dependencies: ["MallocInterposerC"],
             path: "Sources/MallocInterposerSwift"
         ),
+        // Standalone helper the death tests spawn in a clean process — the
+        // guard-page fault only reproduces in a sparsely-mapped address space.
+        .executableTarget(
+            name: "InterposerCrashProbe",
+            dependencies: ["MallocInterposerC"],
+            path: "Tests/InterposerCrashProbe"
+        ),
+        // Unit tests exercise the C interposer's replacement_* functions and
+        // pointer classifier directly, so they depend on the C target. The
+        // dependency on the crash probe ensures it is built before tests run.
+        .testTarget(
+            name: "MallocInterposerTests",
+            dependencies: ["MallocInterposerC", "InterposerCrashProbe"],
+            path: "Tests/MallocInterposerTests"
+        ),
     ]
 )

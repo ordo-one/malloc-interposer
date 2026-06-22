@@ -56,9 +56,22 @@ static inline void *malloc_interposer_user_for(void *raw) {
 
 static inline bool malloc_interposer_is_ours(const void *user_ptr) {
     if (!user_ptr) return false;
-    // Probe the last 4 bytes of the would-be header. For our pointers this
-    // reads our magic; for external pointers it reads into libc chunk
-    // metadata (always present and readable for libc-malloc'd pointers).
+#if __APPLE__
+    // The magic probe below reads the 4 bytes *before* user_ptr. For our own
+    // pointers those bytes are our header, always mapped. For a page-aligned
+    // pointer, though, they fall in the *previous* page — and libc valloc /
+    // large posix_memalign hand back page-aligned pointers backed by a fresh
+    // mmap whose preceding page is unmapped, so the probe would fault.
+    //
+    // Such allocations are libc allocation *starts*, which malloc_zone_from_ptr
+    // resolves to a zone; our pointers are interior (raw + header) and resolve
+    // to NULL, so they still fall through to the magic probe (their preceding
+    // page holds our header and is mapped). Gate on 4096 — the smallest page
+    // size — to keep the zone lookup off the hot path for the common case.
+    if (((uintptr_t)user_ptr & 0xFFFU) == 0 && malloc_zone_from_ptr(user_ptr) != NULL) {
+        return false;
+    }
+#endif
     uint32_t magic;
     memcpy(&magic, (const char *)user_ptr - sizeof(uint32_t), sizeof(magic));
     return magic == MALLOC_INTERPOSER_MAGIC;
@@ -121,6 +134,16 @@ void malloc_interposer_reset(void);
 void malloc_interposer_get_stats(int64_t *malloc_count, int64_t *malloc_bytes,
                                  int64_t *malloc_small, int64_t *malloc_large,
                                  int64_t *free_count, int64_t *free_bytes);
+
+/**
+ * Whether the global malloc hooks are compiled in (non-zero) or not (zero).
+ *
+ * The classifier probes the word *before* a user pointer, which AddressSanitizer
+ * and ThreadSanitizer treat as an out-of-bounds access, so the global hooks are
+ * compiled out under those sanitizers. Tests that drive the hooks directly use
+ * this to skip themselves in sanitizer builds.
+ */
+int malloc_interposer_global_hooks_installed(void);
 
 // Replacement functions (used internally for DYLD_INTERPOSE and Linux overrides)
 void *replacement_malloc(size_t size);

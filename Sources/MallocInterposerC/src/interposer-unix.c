@@ -28,6 +28,26 @@
 
 #include <interposer.h>
 
+// The classifier reads the word *before* a user pointer, which AddressSanitizer
+// and ThreadSanitizer treat as out of bounds, so the global malloc overrides
+// are compiled out under those sanitizers (a benchmarked process is never
+// sanitized anyway).
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer) || __has_feature(thread_sanitizer)
+#    define MALLOC_INTERPOSER_SANITIZER 1
+#  endif
+#endif
+#if !defined(MALLOC_INTERPOSER_SANITIZER) && (defined(__SANITIZE_ADDRESS__) || defined(__SANITIZE_THREAD__))
+#  define MALLOC_INTERPOSER_SANITIZER 1
+#endif
+#ifndef MALLOC_INTERPOSER_SANITIZER
+#  define MALLOC_INTERPOSER_SANITIZER 0
+#endif
+
+int malloc_interposer_global_hooks_installed(void) {
+    return !MALLOC_INTERPOSER_SANITIZER;
+}
+
 /* a big block of memory that we'll use for recursive mallocs */
 static char g_recursive_malloc_mem[10 * 1024 * 1024] = {0};
 /* the index of the first free byte */
@@ -44,6 +64,7 @@ static __thread bool g_in_socket = false;
 static __thread bool g_in_accept = false;
 static __thread bool g_in_accept4 = false;
 static __thread bool g_in_close = false;
+static __thread bool g_in_posix_memalign = false;
 
 /* The types of the variables holding the libc function pointers. */
 typedef void   *(*type_libc_malloc)(size_t);
@@ -54,6 +75,7 @@ typedef int     (*type_libc_socket)(int, int, int);
 typedef int     (*type_libc_accept)(int, struct sockaddr*, socklen_t *);
 typedef int     (*type_libc_accept4)(int, struct sockaddr *, socklen_t *, int);
 typedef int     (*type_libc_close)(int);
+typedef int     (*type_libc_posix_memalign)(void **, size_t, size_t);
 
 /* The (atomic) globals holding the pointer to the original libc implementation. */
 _Atomic type_libc_malloc g_libc_malloc;
@@ -64,6 +86,7 @@ _Atomic type_libc_socket g_libc_socket;
 _Atomic type_libc_accept g_libc_accept;
 _Atomic type_libc_accept4 g_libc_accept4;
 _Atomic type_libc_close g_libc_close;
+_Atomic type_libc_posix_memalign g_libc_posix_memalign;
 
 // ---------------------------------------------------------------------------
 // Counting model
@@ -326,6 +349,12 @@ static int recursive_close(int fildes) {
     (void)fildes;
     abort();
 }
+// posix_memalign is never needed to resolve libc symbols; if we somehow
+// re-enter during the dlsym handshake, fail the allocation rather than recurse.
+static int recursive_posix_memalign(void **memptr, size_t alignment, size_t size) {
+    (void)memptr; (void)alignment; (void)size;
+    return ENOMEM;
+}
 
 #define JUMP_INTO_LIBC_FUN(_fun, ...) /* \
 */ do { /* \
@@ -497,23 +526,31 @@ void *replacement_reallocf(void *user_ptr, size_t new_size) {
     return new_ptr;
 }
 
-// Aligned/legacy paths skip the header (alignment requirements rule it out)
-// and rely on malloc_usable_size for byte accounting.
-
-void *replacement_valloc(size_t size) {
-    // Note: not aligning correctly (should be PAGE_SIZE) but good enough.
-    return replacement_malloc(size);
-}
+// Aligned/legacy paths can't carry our size header: the 16-byte prefix would
+// shift the user pointer off the requested alignment. We let libc place a
+// correctly-aligned (header-less) chunk and account it via malloc_usable_size;
+// the magic probe on free fails for these, routing them through the external
+// path (which also bills them via malloc_usable_size, so alloc/free balance).
 
 int replacement_posix_memalign(void **memptr, size_t alignment, size_t size) {
-    (void)alignment;
-    // Note: not aligning correctly (should be `alignment`) but good enough.
-    void *ptr = replacement_malloc(size);
-    if (ptr && memptr) {
-        *memptr = ptr;
-        return 0;
+    if (!memptr) return EINVAL;
+    int result;
+    CALL_LIBC_FUN_CAPTURE(result, posix_memalign, memptr, alignment, size);
+    if (result == 0 && *memptr
+        && atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {
+        size_t usable;
+        CALL_LIBC_FUN_CAPTURE(usable, malloc_usable_size, *memptr);
+        count_malloc(usable);
     }
-    return ENOMEM;
+    return result;
+}
+
+void *replacement_valloc(size_t size) {
+    void *ptr = NULL;
+    if (replacement_posix_memalign(&ptr, (size_t)g_page_size, size) != 0) {
+        return NULL;
+    }
+    return ptr;
 }
 
 // Size queries --------------------------------------------------------------
@@ -535,6 +572,7 @@ size_t replacement_malloc_usable_size(void *user_ptr) {
 
 // Public symbol overrides ---------------------------------------------------
 
+#if !MALLOC_INTERPOSER_SANITIZER
 void free(void *ptr) { replacement_free(ptr); }
 void *malloc(size_t size) { return replacement_malloc(size); }
 void *calloc(size_t nmemb, size_t size) { return replacement_calloc(nmemb, size); }
@@ -545,5 +583,6 @@ int posix_memalign(void **memptr, size_t alignment, size_t size) {
     return replacement_posix_memalign(memptr, alignment, size);
 }
 size_t malloc_usable_size(void *ptr) { return replacement_malloc_usable_size(ptr); }
+#endif
 
 #endif
