@@ -1,11 +1,21 @@
 //
 // Copyright (c) 2022 Ordo One AB.
+// Copyright (c) 2017-2018 Apple Inc. and the SwiftNIO project authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 //
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// The replacement_* interposition surface declared here (and the
+// DYLD_INTERPOSE-on-Darwin / LD_PRELOAD-on-Linux design it serves) originates
+// in the SwiftNIO open source project's allocation-counter test framework
+// (https://github.com/apple/swift-nio). The header-prefix size-tracking
+// machinery — malloc_header_t, the address-keyed tag, and the pointer
+// classifier — is original to Ordo One AB.
 //
 
 #ifndef INTERPOSER_H
