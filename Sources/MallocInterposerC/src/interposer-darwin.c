@@ -1,11 +1,27 @@
 //
 // Copyright (c) 2022 Ordo One AB.
+// Copyright (c) 2017-2018 Apple Inc. and the SwiftNIO project authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 //
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Portions of this file are derived from the SwiftNIO open source project's
+// allocation-counter test framework — specifically the file
+// IntegrationTests/allocation-counter-tests-framework/.../hooked-functions-darwin.c
+// (https://github.com/apple/swift-nio). The DYLD_INTERPOSE macro and the
+// replacement_* / DYLD_INTERPOSE wiring originate there.
+//
+// Modifications by Ordo One AB: replaced SwiftNIO's global atomic counters with
+// a per-thread TLS counting model; added header-prefix per-allocation size
+// tracking and pointer classification, a small/large size-class split, runtime
+// enable/disable/reset gating, alignment-honouring aligned-allocation paths,
+// and malloc_size interposition; and removed SwiftNIO's socket /
+// file-descriptor-tracking hooks.
 //
 
 #include <assert.h>

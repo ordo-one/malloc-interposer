@@ -1,0 +1,30 @@
+malloc-interposer
+Copyright (c) 2022 Ordo One AB
+
+This product includes software derived from the SwiftNIO open source project.
+
+  SwiftNIO
+  Copyright (c) 2017-2018 Apple Inc. and the SwiftNIO project authors
+  Licensed under the Apache License, Version 2.0
+  https://github.com/apple/swift-nio
+
+Specifically, the libc interposition machinery in
+Sources/MallocInterposerC/src/interposer-darwin.c and
+Sources/MallocInterposerC/src/interposer-unix.c (and the corresponding
+declarations in Sources/MallocInterposerC/include/interposer.h) is derived
+from SwiftNIO's allocation-counter test framework
+(IntegrationTests/allocation-counter-tests-framework):
+
+  * On Darwin: the DYLD_INTERPOSE macro and the replacement_* / DYLD_INTERPOSE
+    wiring.
+  * On Linux: the dlsym(RTLD_NEXT, ...) symbol resolution cached in atomic
+    globals, the recursive-malloc-during-dlsym BSS bump allocator, and the
+    JUMP_INTO_LIBC_FUN macro.
+
+This code has been substantially modified by Ordo One AB — most notably a
+per-thread TLS counting model in place of SwiftNIO's global atomic counters,
+header-prefix per-allocation size tracking with pointer classification, a
+small/large size-class split, runtime enable/disable/reset gating, and
+alignment-honouring aligned-allocation paths. SwiftNIO's socket and
+file-descriptor-tracking hooks were removed. See the per-file headers for a
+summary of the changes.

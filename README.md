@@ -185,6 +185,17 @@ user code and the C symbols.
 - Swift 5.10+
 - macOS 13+ or Linux
 
+## Acknowledgments
+
+The libc interposition technique this package is built on — `DYLD_INTERPOSE`
+on macOS and `dlsym(RTLD_NEXT, …)` symbol resolution (with the
+recursive-malloc-during-`dlsym` workaround) on Linux — is derived from the
+[SwiftNIO](https://github.com/apple/swift-nio) project's allocation-counter
+test framework, by Apple Inc. and the SwiftNIO project authors, used under the
+Apache 2.0 license. The per-thread counting model and the header-prefix size
+tracking layered on top are original to this package. See [`NOTICE`](NOTICE)
+for the full attribution.
+
 ## License
 
 Apache 2.0 — see [`LICENSE`](LICENSE).

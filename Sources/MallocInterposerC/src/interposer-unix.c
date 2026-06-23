@@ -1,11 +1,29 @@
 //
 // Copyright (c) 2022 Ordo One AB.
+// Copyright (c) 2017-2018 Apple Inc. and the SwiftNIO project authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 //
 // You may obtain a copy of the License at
 // http://www.apache.org/licenses/LICENSE-2.0
+//
+// SPDX-License-Identifier: Apache-2.0
+//
+// Portions of this file are derived from the SwiftNIO open source project's
+// allocation-counter test framework — specifically the file
+// IntegrationTests/allocation-counter-tests-framework/.../hooked-functions-unix.c
+// (https://github.com/apple/swift-nio). The libc-resolution machinery
+// originates there: the dlsym(RTLD_NEXT, …) lookup cached in atomic globals,
+// the recursive-malloc-during-dlsym BSS bump allocator, and the
+// JUMP_INTO_LIBC_FUN macro.
+//
+// Modifications by Ordo One AB: replaced SwiftNIO's global atomic counters with
+// a per-thread TLS counting model; added header-prefix per-allocation size
+// tracking and pointer classification, a small/large size-class split, runtime
+// enable/disable/reset gating, alignment-honouring aligned-allocation paths,
+// overflow-checked calloc, and malloc_usable_size interposition; and removed
+// SwiftNIO's socket / file-descriptor-tracking hooks.
 //
 
 #ifndef __APPLE__
@@ -60,10 +78,6 @@ static __thread bool g_in_malloc = false;
 static __thread bool g_in_realloc = false;
 static __thread bool g_in_free = false;
 static __thread bool g_in_malloc_usable_size = false;
-static __thread bool g_in_socket = false;
-static __thread bool g_in_accept = false;
-static __thread bool g_in_accept4 = false;
-static __thread bool g_in_close = false;
 static __thread bool g_in_posix_memalign = false;
 static __thread bool g_in_aligned_alloc = false;
 static __thread bool g_in_memalign = false;
@@ -75,10 +89,6 @@ typedef void   *(*type_libc_calloc)(size_t, size_t);
 typedef void   *(*type_libc_realloc)(void *, size_t);
 typedef void    (*type_libc_free)(void *);
 typedef size_t  (*type_libc_malloc_usable_size)(void *);
-typedef int     (*type_libc_socket)(int, int, int);
-typedef int     (*type_libc_accept)(int, struct sockaddr*, socklen_t *);
-typedef int     (*type_libc_accept4)(int, struct sockaddr *, socklen_t *, int);
-typedef int     (*type_libc_close)(int);
 typedef int     (*type_libc_posix_memalign)(void **, size_t, size_t);
 typedef void   *(*type_libc_aligned_alloc)(size_t, size_t);
 typedef void   *(*type_libc_memalign)(size_t, size_t);
@@ -89,10 +99,6 @@ _Atomic type_libc_calloc g_libc_calloc;
 _Atomic type_libc_realloc g_libc_realloc;
 _Atomic type_libc_free g_libc_free;
 _Atomic type_libc_malloc_usable_size g_libc_malloc_usable_size;
-_Atomic type_libc_socket g_libc_socket;
-_Atomic type_libc_accept g_libc_accept;
-_Atomic type_libc_accept4 g_libc_accept4;
-_Atomic type_libc_close g_libc_close;
 _Atomic type_libc_posix_memalign g_libc_posix_memalign;
 _Atomic type_libc_aligned_alloc g_libc_aligned_alloc;
 _Atomic type_libc_memalign g_libc_memalign;
@@ -352,22 +358,6 @@ static size_t recursive_malloc_usable_size(void *ptr) {
     return 0;
 }
 
-static int recursive_socket(int domain, int type, int protocol) {
-    (void)domain; (void)type; (void)protocol;
-    abort();
-}
-static int recursive_accept(int socket, struct sockaddr *restrict address, socklen_t *restrict address_len) {
-    (void)socket; (void)address; (void)address_len;
-    abort();
-}
-static int recursive_accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags) {
-    (void)sockfd; (void)addr; (void)addrlen; (void)flags;
-    abort();
-}
-static int recursive_close(int fildes) {
-    (void)fildes;
-    abort();
-}
 // The aligned allocators are never needed to resolve libc symbols; if we
 // somehow re-enter during the dlsym handshake, fail the allocation rather than
 // recurse.
