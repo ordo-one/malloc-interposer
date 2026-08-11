@@ -16,6 +16,8 @@
 // process is too populated for that to reproduce in-process.
 //
 //   argv[1] == "free" -> exercise replacement_free (the production free path)
+//   argv[1] == "tagged" -> exercise malloc_interposer_is_ours with a synthetic
+//                           Objective-C tagged pointer
 //   otherwise         -> exercise malloc_interposer_is_ours directly
 //
 // Exit codes:
@@ -23,10 +25,11 @@
 //       allocation as "not ours")
 //   1 : the classifier misclassified an external pointer as ours
 //   3 : allocation failed (inconclusive)
-// A SIGSEGV/SIGBUS termination means the classifier dereferenced the guard
-// page — the bug under test.
+// A SIGSEGV/SIGBUS termination means the classifier dereferenced an
+// unmapped/invalid address — the bug under test.
 
 #include <stdlib.h>
+#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -35,6 +38,15 @@
 int main(int argc, char **argv) {
     size_t pageSize = (size_t)getpagesize();
     int freePath = (argc > 1 && strcmp(argv[1], "free") == 0);
+    int taggedPath = (argc > 1 && strcmp(argv[1], "tagged") == 0);
+
+    if (taggedPath) {
+        // Set both TAG_MASK bits used by objc4: bit 0 on x86_64 and bit 63 on
+        // arm64. This keeps the synthetic probe platform-independent.
+        const uintptr_t taggedPointerBits = ((uintptr_t)1 << 63) | (uintptr_t)1;
+        const void *taggedPointer = (const void *)taggedPointerBits;
+        return replacement_malloc_size(taggedPointer) ? 1 : 0;
+    }
 
     // A few large sizes so at least one lands in its own fresh mmap with an
     // unmapped preceding page.

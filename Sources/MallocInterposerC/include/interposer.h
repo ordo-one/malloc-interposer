@@ -28,6 +28,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #if __APPLE__
+#  include <TargetConditionals.h>
 #  include <malloc/malloc.h>
 #endif
 
@@ -83,6 +84,20 @@ static inline uint32_t malloc_interposer_addr_tag(const void *user_ptr) {
 static inline bool malloc_interposer_is_ours(const void *user_ptr) {
     if (!user_ptr) return false;
 #if __APPLE__
+    // Objective-C tagged pointers use the same marker as objc4's
+    // objc_object::isTaggedPointer(). Intel macOS / x86_64 Mac Catalyst use
+    // bit 0; arm64 macOS, iOS, and iOS Simulator use bit 63. They do not point
+    // to readable storage, so reject them before probing the header immediately
+    // before user_ptr.
+    // Reference: https://github.com/opensource-apple/objc4/blob/cd5e62a5597ea7a31dccef089317abb3a661c154/runtime/objc-object.h#L223
+#  if (TARGET_OS_OSX || TARGET_OS_MACCATALYST) && defined(__x86_64__)
+    // Intel macOS / x86_64 Mac Catalyst: bit 0.
+    if (((uintptr_t)user_ptr & (uintptr_t)1) != 0) return false;
+#  else
+    // arm64 macOS / iOS / iOS Simulator: bit 63.
+    if (((uintptr_t)user_ptr & ((uintptr_t)1 << 63)) != 0) return false;
+#  endif
+
     // The probe below reads the 8 bytes *before* user_ptr. For our own pointers
     // those bytes are our header, always mapped. For a page-aligned pointer,
     // though, they fall in the *previous* page — and libc valloc / large
