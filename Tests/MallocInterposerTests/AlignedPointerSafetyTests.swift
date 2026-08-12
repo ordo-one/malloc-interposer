@@ -61,6 +61,11 @@ struct AlignedPointerSafetyTests {
             try assertCrashProbeSucceeds(mode: "free")
         }
 
+        @Test
+        func isOursDoesNotFaultOnTaggedPointer() throws {
+            try assertCrashProbeSucceeds(mode: "tagged")
+        }
+
         private func assertCrashProbeSucceeds(mode: String) throws {
             let process = Process()
             process.executableURL = try crashProbeURL()

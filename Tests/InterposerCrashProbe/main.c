@@ -17,7 +17,7 @@
 //
 //   argv[1] == "free" -> exercise replacement_free (the production free path)
 //   argv[1] == "tagged" -> exercise malloc_interposer_is_ours with a synthetic
-//                           Objective-C tagged pointer
+//                           Objective-C tagged pointer (Darwin only)
 //   otherwise         -> exercise malloc_interposer_is_ours directly
 //
 // Exit codes:
@@ -41,11 +41,16 @@ int main(int argc, char **argv) {
     int taggedPath = (argc > 1 && strcmp(argv[1], "tagged") == 0);
 
     if (taggedPath) {
+#if __APPLE__
         // Set both TAG_MASK bits used by objc4: bit 0 on x86_64 and bit 63 on
-        // arm64. This keeps the synthetic probe platform-independent.
+        // arm64.
         const uintptr_t taggedPointerBits = ((uintptr_t)1 << 63) | (uintptr_t)1;
         const void *taggedPointer = (const void *)taggedPointerBits;
         return replacement_malloc_size(taggedPointer) ? 1 : 0;
+#else
+        // Objective-C tagged pointers and replacement_malloc_size are Darwin-only.
+        return 0;
+#endif
     }
 
     // A few large sizes so at least one lands in its own fresh mmap with an
