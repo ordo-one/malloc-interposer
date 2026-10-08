@@ -42,8 +42,8 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <malloc/malloc.h>
-#include <stdio.h>
 #include <interposer.h>
+#include "interposer-stacks-internal.h"
 
 // The classifier reads the word *before* a user pointer, which AddressSanitizer
 // and ThreadSanitizer treat as out of bounds, so the global hooks are compiled
@@ -265,6 +265,14 @@ static __attribute__((always_inline)) void count_malloc(size_t size) {
     // is a fixed constant (not the page size) so the split is architecture-
     // independent; see MALLOC_INTERPOSER_LARGE_THRESHOLD.
     b->malloc_size_class[size > MALLOC_INTERPOSER_LARGE_THRESHOLD]++;
+    // Stack capture piggybacks on the counting gate: count_malloc is only
+    // reachable while counting is enabled, so this single extra flag check
+    // is the whole hot-path cost when capture is off.
+    if (__builtin_expect(
+            atomic_load_explicit(&malloc_interposer_stack_capture_enabled, memory_order_relaxed),
+            0)) {
+        malloc_interposer_record_alloc_stack(size);
+    }
 }
 
 static __attribute__((always_inline)) void count_free(size_t size) {
@@ -307,6 +315,7 @@ __attribute__((flatten)) void replacement_free(void *user_ptr) {
         if (atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {
             count_free(hdr->requested_size);
         }
+        malloc_interposer_retire_header(hdr);
         free(hdr);
     } else {
         // External pointer (rare on Darwin once DYLD_INTERPOSE is active).
@@ -347,8 +356,16 @@ __attribute__((flatten)) void *replacement_realloc(void *user_ptr, size_t new_si
         malloc_header_t *old_hdr = malloc_interposer_header_for(user_ptr);
         size_t old_size = old_hdr->requested_size;
 
+        // Retire before realloc: if realloc moves the block, the old chunk is
+        // freed internally and must not keep recognisable residue. If it grows
+        // in place, write_header below restores the fields.
+        malloc_interposer_retire_header(old_hdr);
         void *new_raw = realloc(old_hdr, new_size + sizeof(malloc_header_t));
-        if (!new_raw) return NULL;
+        if (!new_raw) {
+            // realloc failed: the block is still live at old_hdr; restore it.
+            write_header(old_hdr, old_size);
+            return NULL;
+        }
 
         if (counting) {
             count_free(old_size);
@@ -455,8 +472,12 @@ void *replacement_malloc_zone_realloc(malloc_zone_t *zone, void *user_ptr, size_
     if (malloc_interposer_is_ours(user_ptr)) {
         malloc_header_t *old_hdr = malloc_interposer_header_for(user_ptr);
         size_t old_size = old_hdr->requested_size;
+        malloc_interposer_retire_header(old_hdr);
         void *new_raw = malloc_zone_realloc(zone, old_hdr, new_size + sizeof(malloc_header_t));
-        if (!new_raw) return NULL;
+        if (!new_raw) {
+            write_header(old_hdr, old_size);
+            return NULL;
+        }
         if (counting) {
             count_free(old_size);
             count_malloc(new_size);
@@ -489,6 +510,7 @@ void replacement_malloc_zone_free(malloc_zone_t *zone, void *user_ptr) {
         if (atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {
             count_free(hdr->requested_size);
         }
+        malloc_interposer_retire_header(hdr);
         malloc_zone_free(zone, hdr);
     } else {
         if (atomic_load_explicit(&g_counting_enabled, memory_order_relaxed)) {

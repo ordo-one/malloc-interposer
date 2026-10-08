@@ -45,6 +45,7 @@
 #include <pthread.h>
 
 #include <interposer.h>
+#include "interposer-stacks-internal.h"
 
 // The classifier reads the word *before* a user pointer, which AddressSanitizer
 // and ThreadSanitizer treat as out of bounds, so the global malloc overrides
@@ -445,6 +446,14 @@ static __attribute__((always_inline)) void count_malloc(size_t size) {
     // is a fixed constant (not the page size) so the split is architecture-
     // independent; see MALLOC_INTERPOSER_LARGE_THRESHOLD.
     b->malloc_size_class[size > MALLOC_INTERPOSER_LARGE_THRESHOLD]++;
+    // Stack capture piggybacks on the counting gate: count_malloc is only
+    // reachable while counting is enabled, so this single extra flag check
+    // is the whole hot-path cost when capture is off.
+    if (__builtin_expect(
+            atomic_load_explicit(&malloc_interposer_stack_capture_enabled, memory_order_relaxed),
+            0)) {
+        malloc_interposer_record_alloc_stack(size);
+    }
 }
 
 static __attribute__((always_inline)) void count_free(size_t size) {

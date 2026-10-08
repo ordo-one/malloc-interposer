@@ -71,6 +71,13 @@ static inline void *malloc_interposer_user_for(void *raw) {
     return (char *)raw + sizeof(malloc_header_t);
 }
 
+// Clears the identifying fields before a headered chunk is returned to the
+// allocator (free) or reallocated-away.
+static inline void malloc_interposer_retire_header(malloc_header_t *hdr) {
+    hdr->addr_tag = 0;
+    hdr->magic = 0;
+}
+
 // A cheap address-keyed tag stored alongside the magic. The magic alone matches
 // unrelated memory ~1 in 2^32; requiring the preceding word to also equal a hash
 // of *this* pointer's address makes a false positive astronomically unlikely —
@@ -187,6 +194,58 @@ void malloc_interposer_get_stats(int64_t *malloc_count, int64_t *malloc_bytes,
  * this to skip themselves in sanitizer builds.
  */
 int malloc_interposer_global_hooks_installed(void);
+
+
+// ---------------------------------------------------------------------------
+// Allocation call-stack capture (diagnostic mode)
+//
+// When enabled, every counted allocation walks the caller's frame-pointer
+// chain and aggregates the raw return addresses into a fixed-capacity global
+// table keyed by the stack's contents. Capture only occurs while BOTH
+// counting (#malloc_interposer_enable) and stack capture are enabled; the
+// capture hook lives on the counting path. The capture path is
+// allocation-free (stack-local frame buffer, mmap'd table); stacks that fail
+// to walk or don't fit the table are dropped and counted
+// (#malloc_interposer_stacks_dropped); allocation counters remain exact.
+
+void malloc_interposer_stacks_enable(void);
+void malloc_interposer_stacks_disable(void);
+void malloc_interposer_stacks_reset(void);
+
+typedef struct {
+    const void *const *frames; // leaf-first raw return addresses, in-process only
+    uint32_t depth;
+    uint64_t count; // committed windows + the open one (see _mark/_commit)
+    uint64_t bytes;
+} malloc_interposer_stack_t;
+
+typedef void (*malloc_interposer_stack_visitor_t)(const malloc_interposer_stack_t *stack,
+                                                  void *context);
+
+// Measurement windows. Capture can be on across code that must NOT be
+// reported (a benchmark's per-iteration setup before an explicit
+// startMeasurement, the harness's own bookkeeping): `mark` notes every
+// stack's running totals, `commit` adds the growth since the last mark to the
+// stack's reported totals and re-marks. Calling `mark` again before a commit
+// discards whatever was recorded since the previous mark — the same
+// "re-read the start counter" semantics the plain allocation counters have.
+// Both are allocation-free O(unique stacks) loops meant for the control
+// plane; concurrent capture during a mark only blurs the window boundary by
+// the allocations in flight. Without any mark/commit, reports are simply the
+// running totals since the last reset.
+void malloc_interposer_stacks_mark(void);
+void malloc_interposer_stacks_commit(void);
+
+// Number of unique stack records with a non-zero reported count. Call with
+// capture disabled if the result will be used to size a follow-up
+// iterate/copy.
+size_t malloc_interposer_stacks_count(void);
+size_t malloc_interposer_stacks_iterate(malloc_interposer_stack_visitor_t visitor, void *context);
+uint64_t malloc_interposer_stacks_dropped(void);
+
+// Testing only: shrink the capture table capacity (power of two, at most the
+// compile-time default); requires capture disabled.
+void malloc_interposer_stacks_test_set_capacity(uint32_t capacity);
 
 // Replacement functions (used internally for DYLD_INTERPOSE and Linux overrides)
 void *replacement_malloc(size_t size);

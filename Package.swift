@@ -54,11 +54,15 @@ let package = Package(
             path: "Tests/InterposerCrashProbe"
         ),
         // Unit tests exercise the C interposer's replacement_* functions and
-        // pointer classifier directly, so they depend on the C target. The
-        // dependency on the crash probe ensures it is built before tests run.
+        // pointer classifier directly (C target), plus the allocation-stack
+        // capture API through the Swift facade. The crash probe dependency
+        // ensures it is built before tests run.
         .testTarget(
             name: "MallocInterposerTests",
-            dependencies: ["MallocInterposerC", "InterposerCrashProbe"],
+            dependencies: [
+                "MallocInterposerC", "MallocInterposerSwift",
+                "InterposerCrashProbe",
+            ],
             path: "Tests/MallocInterposerTests"
         ),
     ]
