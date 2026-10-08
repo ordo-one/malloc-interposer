@@ -53,12 +53,18 @@ let package = Package(
             dependencies: ["MallocInterposerC"],
             path: "Tests/InterposerCrashProbe"
         ),
+        // Non-allocating thread-local state for the reference allocation hook
+        // in the tests; in C because Swift has no such thread-local.
+        .target(
+            name: "AllocationHookTestSupport",
+            path: "Tests/AllocationHookTestSupport"
+        ),
         // Unit tests exercise the C interposer's replacement_* functions and
         // pointer classifier directly, so they depend on the C target. The
         // dependency on the crash probe ensures it is built before tests run.
         .testTarget(
             name: "MallocInterposerTests",
-            dependencies: ["MallocInterposerC", "InterposerCrashProbe"],
+            dependencies: ["MallocInterposerC", "InterposerCrashProbe", "AllocationHookTestSupport"],
             path: "Tests/MallocInterposerTests"
         ),
     ]

@@ -91,6 +91,9 @@ typedef struct counter_block {
 } counter_block_t;
 
 static _Atomic bool g_counting_enabled = false;
+// Optional per-allocation callback; NULL (the common case) costs one load on
+// the counting path. See malloc_interposer_set_allocation_hook.
+static _Atomic(malloc_interposer_allocation_hook_t) g_allocation_hook = NULL;
 
 static pthread_mutex_t g_list_mutex = PTHREAD_MUTEX_INITIALIZER;
 static counter_block_t *g_blocks_head = NULL;
@@ -191,6 +194,10 @@ void malloc_interposer_disable(void) {
     atomic_store_explicit(&g_counting_enabled, false, memory_order_release);
 }
 
+void malloc_interposer_set_allocation_hook(malloc_interposer_allocation_hook_t hook) {
+    atomic_store_explicit(&g_allocation_hook, hook, memory_order_release);
+}
+
 void malloc_interposer_reset(void) {
     pthread_mutex_lock(&g_list_mutex);
     memset(&g_dead_aggregate, 0, sizeof(g_dead_aggregate));
@@ -265,6 +272,9 @@ static __attribute__((always_inline)) void count_malloc(size_t size) {
     // is a fixed constant (not the page size) so the split is architecture-
     // independent; see MALLOC_INTERPOSER_LARGE_THRESHOLD.
     b->malloc_size_class[size > MALLOC_INTERPOSER_LARGE_THRESHOLD]++;
+    malloc_interposer_allocation_hook_t hook =
+        atomic_load_explicit(&g_allocation_hook, memory_order_acquire);
+    if (__builtin_expect(hook != NULL, 0)) hook(size);
 }
 
 static __attribute__((always_inline)) void count_free(size_t size) {

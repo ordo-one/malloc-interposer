@@ -179,6 +179,32 @@ void malloc_interposer_get_stats(int64_t *malloc_count, int64_t *malloc_bytes,
                                  int64_t *free_count, int64_t *free_bytes);
 
 /**
+ * Callback invoked for every counted allocation.
+ *
+ * @param size  The size accounted for the allocation, on the same basis as
+ *              `malloc_bytes` in #malloc_interposer_get_stats.
+ */
+typedef void (*malloc_interposer_allocation_hook_t)(size_t size);
+
+/**
+ * Install (or, with NULL, remove) a callback invoked for every counted allocation.
+ *
+ * The hook runs on the allocating thread, after the allocation has been
+ * counted, and only while counting is enabled. It is called from inside the
+ * allocator, so it must be reentrancy-safe: an allocation the hook makes
+ * itself goes through the interposer again, is counted, and invokes the hook
+ * again. The interposer provides no recursion guard — the hook must detect
+ * nested invocations itself (e.g. with a thread-local flag) and return early.
+ * Callers that want exact counts should tally those nested allocations and
+ * subtract them.
+ *
+ * Installing or removing the hook is a single atomic store, so it is cheap
+ * enough to toggle around a measured region. The store has release semantics:
+ * state the hook reads must be set up before installing it.
+ */
+void malloc_interposer_set_allocation_hook(malloc_interposer_allocation_hook_t hook);
+
+/**
  * Whether the global malloc hooks are compiled in (non-zero) or not (zero).
  *
  * The classifier probes the word *before* a user pointer, which AddressSanitizer

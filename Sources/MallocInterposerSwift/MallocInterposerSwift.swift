@@ -92,6 +92,24 @@ public class MallocInterposerSwift: @unchecked Sendable {
         malloc_interposer_reset()
     }
 
+    /// A callback invoked for every counted allocation with the accounted size in bytes.
+    public typealias AllocationHook = @convention(c) (Int) -> Void
+
+    /// Installs a callback invoked for every counted allocation, or removes it when `nil`.
+    ///
+    /// The hook runs on the allocating thread, after the allocation has been
+    /// counted, and only while counting is enabled (between ``hook()`` and
+    /// ``unhook()``). It runs inside the allocator, so it must be
+    /// reentrancy-safe: an allocation the hook makes itself is counted and
+    /// invokes the hook again. There is no built-in recursion guard — detect
+    /// nested invocations (e.g. with a thread-local flag), return early, and
+    /// subtract them from the statistics if exact counts matter.
+    ///
+    /// Set up any state the hook reads before installing it.
+    public static func setAllocationHook(_ hook: AllocationHook?) {
+        malloc_interposer_set_allocation_hook(hook)
+    }
+
     /// Reads a consistent snapshot of all counters.
     ///
     /// Each field is read with `memory_order_relaxed`, so the individual

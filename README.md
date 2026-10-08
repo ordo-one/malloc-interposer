@@ -105,6 +105,18 @@ print("frees:  \(stats.freeCount), bytes: \(stats.freeBytesCount)")
 The full DocC reference for the Swift surface lives on the
 `MallocInterposerSwift` class and its `Statistics` struct.
 
+### Per-allocation hook
+
+`setAllocationHook(_:)` installs a C-convention callback that runs on the
+allocating thread for every counted allocation (only while counting is
+enabled), e.g. to capture a stack trace. Pass `nil` to remove it.
+
+The hook runs inside the allocator and the interposer does **not** guard
+against recursion: anything the hook allocates is counted and calls the hook
+again. Guard with a thread-local flag, return early on nested calls, and
+subtract those nested allocations from the statistics if you need exact
+counts.
+
 ## Loading the dylib
 
 Linking against `MallocInterposerSwift` makes the API available, but the
