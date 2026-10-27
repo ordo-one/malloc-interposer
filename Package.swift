@@ -13,11 +13,16 @@ import PackageDescription
 // class of footgun.
 let package = Package(
     name: "malloc-interposer",
-    // aligned_alloc (C11) requires macOS 10.15 / iOS 13; set the floor so the
-    // interposer's aligned_alloc interception doesn't warn on the default target.
+    // macOS 13 / iOS 16 is the documented floor (see README). It also has to be
+    // at least that high because the product is a *dynamic* library: ld links
+    // it against the SDK's Swift runtime stubs, and current SDKs declare those
+    // for macOS 13+, so a lower deployment target makes every consumer's build
+    // emit "building for macOS-12.0, but linking with dylib ... built for
+    // newer version 13.0" warnings. aligned_alloc (C11, macOS 10.15 / iOS 13)
+    // is covered by this floor as well.
     platforms: [
-        .macOS(.v10_15),
-        .iOS(.v13),
+        .macOS(.v13),
+        .iOS(.v16),
     ],
     products: [
         // The dylib to preload (DYLD_INSERT_LIBRARIES / LD_PRELOAD) and to
