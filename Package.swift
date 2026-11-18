@@ -58,6 +58,12 @@ let package = Package(
             dependencies: ["MallocInterposerC"],
             path: "Tests/InterposerCrashProbe"
         ),
+        // Standalone helper for the thread-teardown tests. Links nothing from
+        // this package: it runs with the interposer dylib preloaded.
+        .executableTarget(
+            name: "ThreadTeardownProbe",
+            path: "Tests/ThreadTeardownProbe"
+        ),
         // Non-allocating thread-local state for the reference allocation hook
         // in the tests; in C because Swift has no such thread-local.
         .target(
@@ -69,7 +75,7 @@ let package = Package(
         // dependency on the crash probe ensures it is built before tests run.
         .testTarget(
             name: "MallocInterposerTests",
-            dependencies: ["MallocInterposerC", "InterposerCrashProbe", "AllocationHookTestSupport"],
+            dependencies: ["MallocInterposerC", "InterposerCrashProbe", "ThreadTeardownProbe", "AllocationHookTestSupport"],
             path: "Tests/MallocInterposerTests"
         ),
     ]
