@@ -107,6 +107,11 @@ static _Thread_local counter_block_t *t_block = NULL;
 // allocates, the nested count would otherwise recurse into tls_block_init and
 // deadlock on g_list_mutex.
 static _Thread_local bool t_initializing = false;
+// Set by block_destructor once this thread's block is freed. Allocations can
+// still happen later in the same thread's teardown (other TSD destructors, the
+// runtime's per-thread cleanup); they must neither touch the freed block nor
+// create and re-register a new one, so they are folded into g_dead_aggregate.
+static _Thread_local bool t_block_destroyed = false;
 static pthread_key_t g_block_key;
 static pthread_once_t g_key_once = PTHREAD_ONCE_INIT;
 
@@ -148,6 +153,11 @@ static void block_destructor(void *arg) {
     // Calls from inside this dylib resolve directly to libsystem, so this
     // is the real libc free — not a recursive call into ourselves.
     free(b);
+
+    // Without this, t_block keeps pointing at the freed block, and any later
+    // malloc/free on this thread writes into freed memory.
+    if (t_block == b) t_block = NULL;
+    t_block_destroyed = true;
 }
 
 static void init_block_key(void) {
@@ -178,7 +188,7 @@ static __attribute__((always_inline)) counter_block_t *get_tls_block(void) {
     if (__builtin_expect(b == NULL, 0)) {
         // A reentrant allocation while we're building the block must not recurse
         // back in (that would deadlock on g_list_mutex); skip counting it.
-        if (t_initializing) return NULL;
+        if (t_initializing || t_block_destroyed) return NULL;
         b = tls_block_init();
     }
     return b;
@@ -264,9 +274,32 @@ void malloc_interposer_get_stats(int64_t *malloc_count, int64_t *malloc_bytes,
 // created lazily on first use. Once the pointer is cached in the _Thread_local
 // slot, every subsequent call is a non-atomic increment on private memory.
 
+// Counts from a thread whose block is already gone (see t_block_destroyed).
+// Rare, so a mutex is fine; pthread_mutex_lock does not allocate.
+static __attribute__((noinline)) void count_after_teardown(int64_t malloc_bytes, int size_class,
+                                                         int64_t free_bytes, bool is_free) {
+    pthread_mutex_lock(&g_list_mutex);
+    if (is_free) {
+        g_dead_aggregate.free_count++;
+        g_dead_aggregate.free_bytes += free_bytes;
+    } else {
+        g_dead_aggregate.malloc_bytes += malloc_bytes;
+        g_dead_aggregate.malloc_size_class[size_class]++;
+    }
+    pthread_mutex_unlock(&g_list_mutex);
+}
+
 static __attribute__((always_inline)) void count_malloc(size_t size) {
     counter_block_t *b = get_tls_block();
-    if (__builtin_expect(b == NULL, 0)) return;
+    if (__builtin_expect(b == NULL, 0)) {
+        if (t_block_destroyed) {
+            count_after_teardown((int64_t)size, size > MALLOC_INTERPOSER_LARGE_THRESHOLD, 0, false);
+            malloc_interposer_allocation_hook_t hook =
+                atomic_load_explicit(&g_allocation_hook, memory_order_acquire);
+            if (hook != NULL) hook(size);
+        }
+        return;
+    }
     b->malloc_bytes += (int64_t)size;
     // Branchless small/large split — index 0 is small, 1 is large. The boundary
     // is a fixed constant (not the page size) so the split is architecture-
@@ -279,7 +312,10 @@ static __attribute__((always_inline)) void count_malloc(size_t size) {
 
 static __attribute__((always_inline)) void count_free(size_t size) {
     counter_block_t *b = get_tls_block();
-    if (__builtin_expect(b == NULL, 0)) return;
+    if (__builtin_expect(b == NULL, 0)) {
+        if (t_block_destroyed) count_after_teardown(0, 0, (int64_t)size, true);
+        return;
+    }
     b->free_count++;
     b->free_bytes += (int64_t)size;
 }
